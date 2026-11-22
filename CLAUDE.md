@@ -31,7 +31,8 @@ geometry, no scene graph and no per-pixel work.
 The fragment shader, per pixel:
 
 1. Builds a view ray from the camera basis in the uniforms.
-2. Colours the sky: a zenith-to-horizon gradient, a warm low-sun tint, a halo and a sun disc.
+2. Colours the sky: a zenith-to-horizon gradient, a warm low-sun tint, and a halo around the sun.
+   There is deliberately no sun disc; a hard-edged circle read as pasted on over the soft clouds.
 3. Intersects the ray with a horizontal slab between `CLOUD_BOTTOM` and `CLOUD_TOP`.
 4. Raymarches that slab in `PRIMARY_STEPS` steps, sampling density from fBm value noise shaped by
    a coverage threshold and a vertical profile, scrolled over time by `WIND`.

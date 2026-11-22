@@ -17,10 +17,8 @@ const GROUND:      vec3<f32> = vec3<f32>(0.055, 0.052, 0.042);
 const HORIZON_FALLOFF: f32 = 2.2;   // bigger = thinner haze band
 
 // --- Sun ---
-const SUN_ANGULAR_SIZE: f32 = 0.020;  // radians, half-angle of the disc
-const SUN_COLOR:        vec3<f32> = vec3<f32>(1.0, 0.95, 0.85);
-const SUN_INTENSITY:    f32 = 40.0;
-const SUN_GLOW:         f32 = 0.40;
+const SUN_COLOR: vec3<f32> = vec3<f32>(1.0, 0.95, 0.85);
+const SUN_GLOW:  f32 = 0.40;   // strength of the halo around the sun
 
 // --- Cloud layer geometry (metres above the camera) ---
 const CLOUD_BOTTOM: f32 = 1500.0;
@@ -143,10 +141,9 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
 // ---------------------------------------------------------------------------
 
 fn sky_color(dir: vec3<f32>) -> vec3<f32> {
-    // Angle between this ray and the sun. Working in angle space (rather than
-    // in the raw dot product) keeps the sun disc the size we asked for — near
-    // zero, a small change in angle is a tiny change in cosine, so
-    // thresholding the cosine directly gives a huge soft blob.
+    // Angle between this ray and the sun, used for the halo below. Working in
+    // angle space rather than the raw dot product keeps the falloff even:
+    // near zero, a small change in angle is a tiny change in cosine.
     let cos_sun = clamp(dot(dir, u.sun_dir), -1.0, 1.0);
     let sun_angle = acos(cos_sun);
 
@@ -164,13 +161,10 @@ fn sky_color(dir: vec3<f32>) -> vec3<f32> {
     }
 
     // Broad halo around the sun (forward-scattered light in the atmosphere).
+    // There is no sun disc: the halo alone says where the sun is, and the
+    // phase function does the rest once there is cloud in front of it.
     let glow = exp(-sun_angle * 9.0) * 0.8 + exp(-sun_angle * 1.6) * 0.2;
     col += SUN_COLOR * SUN_GLOW * glow * (0.5 + 1.2 * dusk);
-
-    // The sun disc itself, with an edge about one pixel wide.
-    let edge = 0.0015;
-    let disc = 1.0 - smoothstep(SUN_ANGULAR_SIZE - edge, SUN_ANGULAR_SIZE + edge, sun_angle);
-    col += SUN_COLOR * SUN_INTENSITY * disc * step(0.0, u.sun_dir.y);
 
     return col;
 }
@@ -447,8 +441,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // cloud itself scattered towards us.
     var col = sky * clouds.transmittance + clouds.scattered;
 
-    // Tone mapping: the sun disc is far brighter than 1.0, so compress the
-    // high end instead of letting it clip to flat white.
+    // Tone mapping: sunlit cloud and the halo both run well past 1.0, so
+    // compress the high end instead of letting it clip to flat white.
     col = col / (1.0 + col);
     // The target format is sRGB, so the GPU applies the final encoding for us.
     return vec4<f32>(col, 1.0);
