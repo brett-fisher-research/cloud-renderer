@@ -1,6 +1,6 @@
 // ===========================================================================
 //  Volumetric clouds — single fragment shader.
-//  Step 3: sky + noise-shaped clouds raymarched through a slab.
+//  Step 4: noise-shaped clouds with sun lighting and self-shadowing.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -54,6 +54,26 @@ const CLOUD_TOP_SOFTNESS:  f32 = 0.55;  // fade-out below the top
 
 // --- Wind ---
 const WIND: vec3<f32> = vec3<f32>(-9.0, 0.0, -3.0);  // metres per second
+
+// --- Lighting ---
+// Steps taken towards the sun from each view sample to find the shadow.
+const LIGHT_STEPS: i32 = 6;
+const LIGHT_STEP_SIZE: f32 = 110.0;   // metres, length of the first step
+const LIGHT_STEP_GROWTH: f32 = 1.55;  // each step is longer than the last
+// Scales the self-shadowing. Below 1.0 fakes the extra brightness that real
+// clouds get from light bouncing around inside them many times, which single
+// scattering alone does not capture and which otherwise leaves them muddy.
+const SHADOW_STRENGTH: f32 = 0.60;
+
+const SUN_LIGHT: vec3<f32> = vec3<f32>(1.0, 0.93, 0.80);
+const SUN_LIGHT_INTENSITY: f32 = 3.2;
+
+// Skylight landing on the cloud from the whole dome. Keeps shadowed sides
+// blue-grey rather than black.
+const AMBIENT_COLOR: vec3<f32> = vec3<f32>(0.42, 0.55, 0.78);
+const AMBIENT_INTENSITY: f32 = 0.55;
+// Undersides see less sky than tops, so dim ambient towards the cloud base.
+const AMBIENT_BASE_DARKENING: f32 = 0.45;
 
 // ---------------------------------------------------------------------------
 //  Uniforms — must match `struct Uniforms` in src/camera.rs exactly.
@@ -266,6 +286,32 @@ fn cloud_density(p: vec3<f32>) -> f32 {
     return shaped * profile * DENSITY;
 }
 
+// ---------------------------------------------------------------------------
+//  Lighting
+// ---------------------------------------------------------------------------
+
+// How much sunlight reaches a point inside the cloud.
+//
+// We walk from the sample towards the sun, adding up how much cloud is in the
+// way (the "optical depth"), then apply Beer's law once: exp(-depth). Steps
+// get longer as they go, because distant blockers matter less than nearby
+// ones and this buys depth cheaply. Six steps is enough to read as shadowing.
+fn light_march(p: vec3<f32>) -> f32 {
+    var optical_depth = 0.0;
+    var t = 0.0;
+    var step = LIGHT_STEP_SIZE;
+
+    for (var i = 0; i < LIGHT_STEPS; i = i + 1) {
+        // Sample at the middle of the step.
+        let sp = p + u.sun_dir * (t + step * 0.5);
+        optical_depth += cloud_density(sp) * step;
+        t += step;
+        step *= LIGHT_STEP_GROWTH;
+    }
+
+    return exp(-optical_depth * EXTINCTION * SHADOW_STRENGTH);
+}
+
 // Result of marching the cloud layer: how much light got through, and how
 // much the cloud itself added.
 struct CloudResult {
@@ -306,8 +352,16 @@ fn march_clouds(origin: vec3<f32>, dir: vec3<f32>) -> CloudResult {
         let sigma = density * EXTINCTION;
         let step_transmittance = exp(-sigma * dt);
 
-        // Flat ambient colour for now; real sun lighting arrives in step 4.
-        let luminance = FOG_COLOR;
+        // How much sun reaches this point through the cloud above it.
+        let sun_visibility = light_march(p);
+        let sunlight = SUN_LIGHT * SUN_LIGHT_INTENSITY * sun_visibility;
+
+        // Skylight, dimmed towards the base where less of the dome is visible.
+        let h = clamp((p.y - CLOUD_BOTTOM) / (CLOUD_TOP - CLOUD_BOTTOM), 0.0, 1.0);
+        let ambient = AMBIENT_COLOR * AMBIENT_INTENSITY
+                    * mix(AMBIENT_BASE_DARKENING, 1.0, h);
+
+        let luminance = sunlight + ambient;
 
         result.scattered += luminance * (1.0 - step_transmittance) * result.transmittance;
         result.transmittance *= step_transmittance;
