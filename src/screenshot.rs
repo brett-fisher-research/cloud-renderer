@@ -15,7 +15,14 @@ pub const HEIGHT: u32 = 720;
 /// window shows: the GPU applies linear -> sRGB encoding on write for us.
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-pub fn render_to_png(path: &str, time: f32, sun_elevation: Option<f32>) -> Result<()> {
+pub struct ShotOptions {
+    pub time: f32,
+    pub sun_elevation: Option<f32>,
+    pub yaw: Option<f32>,
+    pub pitch: Option<f32>,
+}
+
+pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
     log::info!("headless render {WIDTH}x{HEIGHT} -> {path}");
 
     let gpu = Gpu::new(create_instance(), None)?;
@@ -39,10 +46,23 @@ pub fn render_to_png(path: &str, time: f32, sun_elevation: Option<f32>) -> Resul
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     let mut camera = Camera::default();
-    if let Some(elev) = sun_elevation {
+    if let Some(elev) = opts.sun_elevation {
         camera.sun_elevation = elev;
     }
-    renderer.update(&gpu, &camera.uniforms(WIDTH, HEIGHT, time));
+    if let Some(yaw) = opts.yaw {
+        camera.yaw = yaw;
+    }
+    if let Some(pitch) = opts.pitch {
+        camera.pitch = pitch;
+    }
+    log::info!(
+        "camera yaw {:.2} pitch {:.2}, sun elevation {:.2}, t = {:.1}s",
+        camera.yaw,
+        camera.pitch,
+        camera.sun_elevation,
+        opts.time
+    );
+    renderer.update(&gpu, &camera.uniforms(WIDTH, HEIGHT, opts.time));
 
     // GPU texture rows must start on a 256-byte boundary when copied to a
     // buffer, so the readback buffer may be wider than the image itself.

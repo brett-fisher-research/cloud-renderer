@@ -205,6 +205,8 @@ fn build_pipeline(
         cache: None,
     });
 
+    // wgpu's Display already includes the full WGSL diagnostic with line
+    // numbers and a caret pointing at the offending token.
     match pollster::block_on(scope.pop()) {
         Some(err) => Err(err.to_string()),
         None => Ok(pipeline),

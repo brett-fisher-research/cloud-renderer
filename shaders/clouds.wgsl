@@ -1,6 +1,6 @@
 // ===========================================================================
 //  Volumetric clouds — single fragment shader.
-//  Step 4: noise-shaped clouds with sun lighting and self-shadowing.
+//  Step 5: lit, animated clouds with a Henyey-Greenstein phase function.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -74,6 +74,16 @@ const AMBIENT_COLOR: vec3<f32> = vec3<f32>(0.42, 0.55, 0.78);
 const AMBIENT_INTENSITY: f32 = 0.55;
 // Undersides see less sky than tops, so dim ambient towards the cloud base.
 const AMBIENT_BASE_DARKENING: f32 = 0.45;
+
+// --- Phase function ---
+// Water droplets scatter light mostly *forwards*, which is why a cloud with
+// the sun behind it has a blazing silver lining. g is how directional that
+// is: 0 scatters evenly, towards 1 is a tight forward beam, negative is
+// backwards. Real droplets do both, so we mix a strong forward lobe with a
+// weak backward one.
+const PHASE_G_FORWARD:  f32 = 0.72;
+const PHASE_G_BACKWARD: f32 = -0.28;
+const PHASE_BLEND:      f32 = 0.62;   // weight of the forward lobe
 
 // ---------------------------------------------------------------------------
 //  Uniforms — must match `struct Uniforms` in src/camera.rs exactly.
@@ -290,6 +300,24 @@ fn cloud_density(p: vec3<f32>) -> f32 {
 //  Lighting
 // ---------------------------------------------------------------------------
 
+// Henyey-Greenstein phase function: given the angle between the direction
+// light came from and the direction we are looking, how much of it is
+// scattered our way. Normalised so that g = 0 (even scattering) returns 1.0.
+fn henyey_greenstein(cos_theta: f32, g: f32) -> f32 {
+    let g2 = g * g;
+    let denom = 1.0 + g2 - 2.0 * g * cos_theta;
+    return (1.0 - g2) / pow(max(denom, 0.0001), 1.5);
+}
+
+// Two-lobe mix: a strong forward lobe plus a weak backward one.
+fn cloud_phase(cos_theta: f32) -> f32 {
+    return mix(
+        henyey_greenstein(cos_theta, PHASE_G_BACKWARD),
+        henyey_greenstein(cos_theta, PHASE_G_FORWARD),
+        PHASE_BLEND,
+    );
+}
+
 // How much sunlight reaches a point inside the cloud.
 //
 // We walk from the sample towards the sun, adding up how much cloud is in the
@@ -338,6 +366,10 @@ fn march_clouds(origin: vec3<f32>, dir: vec3<f32>) -> CloudResult {
 
     let dt = (hit.y - hit.x) / f32(PRIMARY_STEPS);
 
+    // The view-to-sun angle is the same for every sample along this ray, so
+    // the phase function only needs evaluating once per pixel.
+    let phase = cloud_phase(dot(dir, u.sun_dir));
+
     for (var i = 0; i < PRIMARY_STEPS; i = i + 1) {
         // Sample at the middle of each step, which integrates more accurately
         // than sampling at the near edge.
@@ -354,7 +386,7 @@ fn march_clouds(origin: vec3<f32>, dir: vec3<f32>) -> CloudResult {
 
         // How much sun reaches this point through the cloud above it.
         let sun_visibility = light_march(p);
-        let sunlight = SUN_LIGHT * SUN_LIGHT_INTENSITY * sun_visibility;
+        let sunlight = SUN_LIGHT * SUN_LIGHT_INTENSITY * sun_visibility * phase;
 
         // Skylight, dimmed towards the base where less of the dome is visible.
         let h = clamp((p.y - CLOUD_BOTTOM) / (CLOUD_TOP - CLOUD_BOTTOM), 0.0, 1.0);

@@ -21,6 +21,8 @@ struct Args {
     screenshot: Option<String>,
     time: f32,
     sun: Option<f32>,
+    yaw: Option<f32>,
+    pitch: Option<f32>,
     vsync: bool,
 }
 
@@ -29,6 +31,8 @@ fn parse_args() -> Result<Args> {
         screenshot: None,
         time: 0.0,
         sun: None,
+        yaw: None,
+        pitch: None,
         vsync: true,
     };
     let mut it = std::env::args().skip(1);
@@ -45,6 +49,14 @@ fn parse_args() -> Result<Args> {
                 let v = it.next().context("--sun needs a number (radians)")?;
                 args.sun = Some(v.parse().with_context(|| format!("bad --sun: {v}"))?);
             }
+            "--yaw" => {
+                let v = it.next().context("--yaw needs a number (radians)")?;
+                args.yaw = Some(v.parse().with_context(|| format!("bad --yaw: {v}"))?);
+            }
+            "--pitch" => {
+                let v = it.next().context("--pitch needs a number (radians)")?;
+                args.pitch = Some(v.parse().with_context(|| format!("bad --pitch: {v}"))?);
+            }
             "--no-vsync" => args.vsync = false,
             "--help" | "-h" => {
                 println!(
@@ -53,6 +65,7 @@ fn parse_args() -> Result<Args> {
                      --screenshot <out.png>          render one 1280x720 frame headlessly\n\
                      --time <seconds>                animation time for the screenshot\n\
                      --sun <radians>                 sun elevation (0 = horizon, 1.57 = zenith)\n\
+                     --yaw, --pitch <radians>        camera direction for the screenshot\n\
                      --no-vsync                      uncap the frame rate (benchmarking)\n"
                 );
                 std::process::exit(0);
@@ -70,7 +83,15 @@ fn main() -> Result<()> {
     let args = parse_args()?;
 
     match args.screenshot {
-        Some(path) => screenshot::render_to_png(&path, args.time, args.sun),
+        Some(path) => screenshot::render_to_png(
+            &path,
+            &screenshot::ShotOptions {
+                time: args.time,
+                sun_elevation: args.sun,
+                yaw: args.yaw,
+                pitch: args.pitch,
+            },
+        ),
         None => app::App::run(args.vsync),
     }
 }
