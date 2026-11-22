@@ -33,6 +33,11 @@ const MAX_DISTANCE: f32 = 50000.0;
 const PRIMARY_STEPS: i32 = 64;      // samples along the view ray
 // Give up once the cloud has blocked ~99% of the light behind it.
 const MIN_TRANSMITTANCE: f32 = 0.01;
+// Offset each pixel's first sample by up to this fraction of a step. With a
+// fixed step count, neighbouring pixels sample at almost the same depths and
+// the error lines up into visible arcs; nudging each pixel breaks those bands
+// into fine noise, which the eye forgives far more readily. 0 disables it.
+const JITTER: f32 = 1.0;
 
 // --- Density ---
 const DENSITY: f32 = 1.0;           // overall multiplier on cloud thickness
@@ -213,6 +218,14 @@ fn slab_intersect(origin: vec3<f32>, dir: vec3<f32>) -> vec2<f32> {
 //  roadmap replaces it with noise baked into a 3D texture by a compute shader.
 // ---------------------------------------------------------------------------
 
+// "Interleaved gradient noise": a cheap screen-space dither that looks evenly
+// scattered rather than streaky. It depends only on the pixel coordinate, so
+// it is stable from frame to frame — a time-varying jitter would make the
+// image fizz instead of banding, which is worse without temporal filtering.
+fn dither(pixel: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))));
+}
+
 // Hash a 3D grid cell to a pseudo-random number in [0,1).
 // This is the standard "hash without sine" trick: multiply into a fractional
 // range, mix the components together, and keep the fractional part.
@@ -354,7 +367,7 @@ struct CloudResult {
 // the total transmittance. The light the cloud *adds* over a step is
 // (1 - exp(-s*dt)) — the fraction it absorbed from behind, re-emitted as
 // scattered light — weighted by how much of it survives back to the eye.
-fn march_clouds(origin: vec3<f32>, dir: vec3<f32>) -> CloudResult {
+fn march_clouds(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<f32>) -> CloudResult {
     var result: CloudResult;
     result.transmittance = 1.0;
     result.scattered = vec3<f32>(0.0);
@@ -370,10 +383,14 @@ fn march_clouds(origin: vec3<f32>, dir: vec3<f32>) -> CloudResult {
     // the phase function only needs evaluating once per pixel.
     let phase = cloud_phase(dot(dir, u.sun_dir));
 
+    // Where in the first step this pixel starts sampling.
+    let offset = mix(0.5, dither(pixel), JITTER);
+
     for (var i = 0; i < PRIMARY_STEPS; i = i + 1) {
-        // Sample at the middle of each step, which integrates more accurately
-        // than sampling at the near edge.
-        let t = hit.x + (f32(i) + 0.5) * dt;
+        // Sample partway into each step: 0.5 would be the midpoint, which
+        // integrates more accurately than the near edge, and the dither
+        // spreads that offset out across neighbouring pixels.
+        let t = hit.x + (f32(i) + offset) * dt;
         let p = origin + dir * t;
 
         let density = cloud_density(p);
@@ -424,7 +441,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let origin = vec3<f32>(0.0, CAMERA_HEIGHT, 0.0);
 
     let sky = sky_color(dir);
-    let clouds = march_clouds(origin, dir);
+    let clouds = march_clouds(origin, dir, in.clip_pos.xy);
 
     // Composite: whatever of the sky survives through the cloud, plus what the
     // cloud itself scattered towards us.
