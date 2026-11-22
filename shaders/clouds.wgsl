@@ -1,6 +1,6 @@
 // ===========================================================================
 //  Volumetric clouds — single fragment shader.
-//  Step 2: sky + a raymarched slab of uniform fog.
+//  Step 3: sky + noise-shaped clouds raymarched through a slab.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -34,10 +34,26 @@ const PRIMARY_STEPS: i32 = 64;      // samples along the view ray
 // Give up once the cloud has blocked ~99% of the light behind it.
 const MIN_TRANSMITTANCE: f32 = 0.01;
 
-// --- Density / lighting (placeholder values for step 2) ---
-const DENSITY: f32 = 1.0;           // uniform for now; noise comes in step 3
-const EXTINCTION: f32 = 0.0004;     // per metre: how fast cloud blocks light
+// --- Density ---
+const DENSITY: f32 = 1.0;           // overall multiplier on cloud thickness
+const EXTINCTION: f32 = 0.004;      // per metre: how fast cloud blocks light
 const FOG_COLOR: vec3<f32> = vec3<f32>(0.85, 0.88, 0.95);
+
+// --- Noise shaping ---
+// Size of the largest noise features, in metres. Smaller = busier sky.
+const NOISE_FEATURE_SIZE: f32 = 2600.0;
+const FBM_OCTAVES: i32 = 5;         // layers of detail; cost scales with this
+const FBM_GAIN: f32 = 0.5;          // how much quieter each octave is
+const FBM_LACUNARITY: f32 = 2.02;   // how much finer each octave is
+
+// 0 = empty sky, 1 = solid overcast. Around 0.45 gives puffy clouds with gaps.
+const COVERAGE: f32 = 0.45;
+// Where in the slab the cloud sits: fractions of the layer height.
+const CLOUD_BASE_SOFTNESS: f32 = 0.22;  // fade-in above the bottom
+const CLOUD_TOP_SOFTNESS:  f32 = 0.55;  // fade-out below the top
+
+// --- Wind ---
+const WIND: vec3<f32> = vec3<f32>(-9.0, 0.0, -3.0);  // metres per second
 
 // ---------------------------------------------------------------------------
 //  Uniforms — must match `struct Uniforms` in src/camera.rs exactly.
@@ -155,10 +171,99 @@ fn slab_intersect(origin: vec3<f32>, dir: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(t_enter, t_exit);
 }
 
+// ---------------------------------------------------------------------------
+//  Noise
+//
+//  Clouds are shaped by *fractal noise*: a smooth random field summed at
+//  several scales. One big smooth layer gives the overall blobs; each finer
+//  layer adds wispier detail at half the amplitude. The sum is called fBm
+//  (fractional Brownian motion).
+//
+//  This is all computed per sample, which is simple but expensive. The
+//  roadmap replaces it with noise baked into a 3D texture by a compute shader.
+// ---------------------------------------------------------------------------
+
+// Hash a 3D grid cell to a pseudo-random number in [0,1).
+// This is the standard "hash without sine" trick: multiply into a fractional
+// range, mix the components together, and keep the fractional part.
+fn hash13(p_in: vec3<f32>) -> f32 {
+    var p = fract(p_in * 0.1031);
+    p += dot(p, p.zyx + 31.32);
+    return fract((p.x + p.y) * p.z);
+}
+
+// Smooth value noise: random values on an integer lattice, interpolated.
+fn value_noise(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    // Smoothstep the interpolation weights so the result has no visible
+    // creases where it crosses a cell boundary.
+    let w = f * f * (3.0 - 2.0 * f);
+
+    let n000 = hash13(i + vec3<f32>(0.0, 0.0, 0.0));
+    let n100 = hash13(i + vec3<f32>(1.0, 0.0, 0.0));
+    let n010 = hash13(i + vec3<f32>(0.0, 1.0, 0.0));
+    let n110 = hash13(i + vec3<f32>(1.0, 1.0, 0.0));
+    let n001 = hash13(i + vec3<f32>(0.0, 0.0, 1.0));
+    let n101 = hash13(i + vec3<f32>(1.0, 0.0, 1.0));
+    let n011 = hash13(i + vec3<f32>(0.0, 1.0, 1.0));
+    let n111 = hash13(i + vec3<f32>(1.0, 1.0, 1.0));
+
+    // Trilinear interpolation between the eight corners of the cell.
+    let x00 = mix(n000, n100, w.x);
+    let x10 = mix(n010, n110, w.x);
+    let x01 = mix(n001, n101, w.x);
+    let x11 = mix(n011, n111, w.x);
+    return mix(mix(x00, x10, w.y), mix(x01, x11, w.y), w.z);
+}
+
+// Sum several octaves of value noise. Result is normalised to roughly [0,1].
+fn fbm(p_in: vec3<f32>) -> f32 {
+    var p = p_in;
+    var amplitude = 0.5;
+    var total = 0.0;
+    var norm = 0.0;
+
+    for (var i = 0; i < FBM_OCTAVES; i = i + 1) {
+        total += amplitude * value_noise(p);
+        norm += amplitude;
+        p *= FBM_LACUNARITY;
+        amplitude *= FBM_GAIN;
+        // Offset each octave so the lattices do not line up and produce a
+        // visible grid.
+        p += vec3<f32>(17.3, 9.1, 23.7);
+    }
+
+    return total / norm;
+}
+
 // Density of the cloud medium at a world-space point.
-// Step 2: uniform inside the slab. Step 3 replaces this with fractal noise.
 fn cloud_density(p: vec3<f32>) -> f32 {
-    return DENSITY;
+    // Height through the layer, 0 at the bottom and 1 at the top.
+    let h = (p.y - CLOUD_BOTTOM) / (CLOUD_TOP - CLOUD_BOTTOM);
+    if (h < 0.0 || h > 1.0) {
+        return 0.0;
+    }
+
+    // Vertical profile: clouds have a flattish base and a soft, rounded top,
+    // so fade density in quickly above the base and out gradually below the top.
+    let profile = smoothstep(0.0, CLOUD_BASE_SOFTNESS, h)
+                * (1.0 - smoothstep(CLOUD_TOP_SOFTNESS, 1.0, h));
+
+    // Scroll the noise field to make the clouds drift. Moving the *sample
+    // point* against the wind is the same as moving the clouds with it.
+    let drift = WIND * u.time;
+    let q = (p + drift) / NOISE_FEATURE_SIZE;
+
+    let n = fbm(q);
+
+    // Coverage: everything below the threshold becomes clear sky, and what
+    // remains is rescaled back to [0,1] so the clouds keep their full density
+    // instead of thinning out as coverage drops.
+    let threshold = 1.0 - COVERAGE;
+    let shaped = clamp((n - threshold) / max(COVERAGE, 0.001), 0.0, 1.0);
+
+    return shaped * profile * DENSITY;
 }
 
 // Result of marching the cloud layer: how much light got through, and how

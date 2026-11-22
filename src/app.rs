@@ -29,6 +29,8 @@ struct Active {
 
 pub struct App {
     active: Option<Active>,
+    /// false = present as fast as the GPU can, for benchmarking.
+    vsync: bool,
     camera: Camera,
     start: Instant,
 
@@ -39,6 +41,7 @@ pub struct App {
     // FPS counter state.
     frames: u32,
     last_fps_update: Instant,
+    last_fps_log: Instant,
     fps: f32,
 }
 
@@ -46,22 +49,25 @@ impl App {
     pub fn new() -> Self {
         Self {
             active: None,
+            vsync: true,
             camera: Camera::default(),
             start: Instant::now(),
             dragging: false,
             last_cursor: None,
             frames: 0,
             last_fps_update: Instant::now(),
+            last_fps_log: Instant::now(),
             fps: 0.0,
         }
     }
 
-    pub fn run() -> Result<()> {
+    pub fn run(vsync: bool) -> Result<()> {
         let event_loop = EventLoop::new().context("failed to create event loop")?;
         // Poll (rather than Wait) so we render continuously — the clouds drift
         // even when there is no input.
         event_loop.set_control_flow(ControlFlow::Poll);
         let mut app = Self::new();
+        app.vsync = vsync;
         event_loop.run_app(&mut app).context("event loop failed")?;
         Ok(())
     }
@@ -132,6 +138,12 @@ impl App {
                     self.fps, active.config.width, active.config.height, sun_deg
                 ));
             }
+
+            // Also log it, so a slow frame rate is visible without the window.
+            if self.last_fps_log.elapsed().as_secs_f32() >= 2.0 {
+                self.last_fps_log = Instant::now();
+                log::info!("{:.1} fps ({:.2} ms/frame)", self.fps, 1000.0 / self.fps.max(0.001));
+            }
         }
     }
 
@@ -185,7 +197,12 @@ impl ApplicationHandler for App {
             .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
             .expect("surface is not supported by this adapter");
         // Fifo = vsync, which is what we want for a smooth look-around.
-        config.present_mode = wgpu::PresentMode::Fifo;
+        // Immediate uncaps the frame rate so we can see real GPU cost.
+        config.present_mode = if self.vsync {
+            wgpu::PresentMode::Fifo
+        } else {
+            wgpu::PresentMode::Immediate
+        };
         surface.configure(&gpu.device, &config);
         log::info!(
             "surface configured: {}x{} format {:?} present {:?}",

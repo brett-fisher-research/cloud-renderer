@@ -21,6 +21,7 @@ struct Args {
     screenshot: Option<String>,
     time: f32,
     sun: Option<f32>,
+    vsync: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -28,6 +29,7 @@ fn parse_args() -> Result<Args> {
         screenshot: None,
         time: 0.0,
         sun: None,
+        vsync: true,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -43,13 +45,15 @@ fn parse_args() -> Result<Args> {
                 let v = it.next().context("--sun needs a number (radians)")?;
                 args.sun = Some(v.parse().with_context(|| format!("bad --sun: {v}"))?);
             }
+            "--no-vsync" => args.vsync = false,
             "--help" | "-h" => {
                 println!(
                     "cloud-renderer\n\n\
                      (no args)                       open a window\n\
                      --screenshot <out.png>          render one 1280x720 frame headlessly\n\
                      --time <seconds>                animation time for the screenshot\n\
-                     --sun <radians>                 sun elevation (0 = horizon, 1.57 = zenith)\n"
+                     --sun <radians>                 sun elevation (0 = horizon, 1.57 = zenith)\n\
+                     --no-vsync                      uncap the frame rate (benchmarking)\n"
                 );
                 std::process::exit(0);
             }
@@ -67,6 +71,6 @@ fn main() -> Result<()> {
 
     match args.screenshot {
         Some(path) => screenshot::render_to_png(&path, args.time, args.sun),
-        None => app::App::run(),
+        None => app::App::run(args.vsync),
     }
 }
