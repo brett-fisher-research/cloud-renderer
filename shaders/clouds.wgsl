@@ -40,7 +40,6 @@ const JITTER: f32 = 1.0;
 // --- Density ---
 const DENSITY: f32 = 1.0;           // overall multiplier on cloud thickness
 const EXTINCTION: f32 = 0.004;      // per metre: how fast cloud blocks light
-const FOG_COLOR: vec3<f32> = vec3<f32>(0.85, 0.88, 0.95);
 
 // --- Noise shaping ---
 // Size of the largest noise features, in metres. Smaller = busier sky.
@@ -54,6 +53,15 @@ const COVERAGE: f32 = 0.45;
 // Where in the slab the cloud sits: fractions of the layer height.
 const CLOUD_BASE_SOFTNESS: f32 = 0.22;  // fade-in above the bottom
 const CLOUD_TOP_SOFTNESS:  f32 = 0.55;  // fade-out below the top
+
+// --- Aerial perspective ---
+// The air between you and a cloud both absorbs its light and scatters
+// sunlight towards you in its place, so distant clouds trend towards the
+// colour of the sky around them and finally vanish into it. Without this,
+// cloud 40 km away stays as crisp and dark as cloud overhead, and all the
+// perspective compression near the horizon piles up as a hard grey stripe.
+// This is the distance at which ~63% of a cloud's colour has been replaced.
+const AERIAL_DISTANCE: f32 = 35000.0;
 
 // --- Wind ---
 const WIND: vec3<f32> = vec3<f32>(-9.0, 0.0, -3.0);  // metres per second
@@ -361,7 +369,12 @@ struct CloudResult {
 // the total transmittance. The light the cloud *adds* over a step is
 // (1 - exp(-s*dt)) — the fraction it absorbed from behind, re-emitted as
 // scattered light — weighted by how much of it survives back to the eye.
-fn march_clouds(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<f32>) -> CloudResult {
+fn march_clouds(
+    origin: vec3<f32>,
+    dir: vec3<f32>,
+    pixel: vec2<f32>,
+    air: vec3<f32>,   // sky radiance along this ray: what haze fades towards
+) -> CloudResult {
     var result: CloudResult;
     result.transmittance = 1.0;
     result.scattered = vec3<f32>(0.0);
@@ -371,6 +384,11 @@ fn march_clouds(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<f32>) -> CloudRes
         return result;
     }
 
+    // Note: near the horizon this step is ~390 m, far coarser than the
+    // finest noise octave. Capping it was measured and changed nothing: the
+    // JITTER offset already scatters the error into noise, and a ray that
+    // shallow crosses so much cloud that MIN_TRANSMITTANCE breaks the loop
+    // after a handful of samples.
     let dt = (hit.y - hit.x) / f32(PRIMARY_STEPS);
 
     // The view-to-sun angle is the same for every sample along this ray, so
@@ -404,7 +422,14 @@ fn march_clouds(origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<f32>) -> CloudRes
         let ambient = AMBIENT_COLOR * AMBIENT_INTENSITY
                     * mix(AMBIENT_BASE_DARKENING, 1.0, h);
 
-        let luminance = sunlight + ambient;
+        // Aerial perspective. Beer's law again, but for the clear air along
+        // the way: exp(-t / AERIAL_DISTANCE) of the cloud's own light reaches
+        // the eye and airlight makes up the rest. Fading towards `air` -- the
+        // sky colour for this exact ray -- means a fully hazed cloud emits
+        // precisely what the sky behind it would have, so it disappears
+        // rather than turning into a grey silhouette.
+        let haze = 1.0 - exp(-t / AERIAL_DISTANCE);
+        let luminance = mix(sunlight + ambient, air, haze);
 
         result.scattered += luminance * (1.0 - step_transmittance) * result.transmittance;
         result.transmittance *= step_transmittance;
@@ -435,7 +460,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let origin = vec3<f32>(0.0, CAMERA_HEIGHT, 0.0);
 
     let sky = sky_color(dir);
-    let clouds = march_clouds(origin, dir, in.clip_pos.xy);
+    let clouds = march_clouds(origin, dir, in.clip_pos.xy, sky);
 
     // Composite: whatever of the sky survives through the cloud, plus what the
     // cloud itself scattered towards us.

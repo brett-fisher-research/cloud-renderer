@@ -39,7 +39,9 @@ The fragment shader, per pixel:
 5. At each sample, marches `LIGHT_STEPS` towards the sun and applies Beer's law to find how much
    sunlight arrives, then weights it by a two-lobe Henyey-Greenstein phase function and adds
    ambient skylight.
-6. Composites the cloud over the sky using accumulated transmittance, then tone maps.
+6. Fades each sample towards the sky colour for that ray with distance (`AERIAL_DISTANCE`),
+   which is what makes distant clouds recede instead of piling into a stripe at the horizon.
+7. Composites the cloud over the sky using accumulated transmittance, then tone maps.
 
 ### Conventions worth knowing
 
@@ -87,7 +89,8 @@ Measured at 1280x720 on an AMD RX 7800 XT (RADV, Mesa 24.2.8), via `--no-vsync`:
 | --- | --- |
 | Sky only | ~0.1 ms |
 | Noise clouds, no lighting | 2.3 ms |
-| With sun light march | 7.6 ms |
+| With sun light march | 7.8 ms |
+| With aerial perspective | 8.0 ms |
 
 Cost scales with `PRIMARY_STEPS` times `LIGHT_STEPS` times `FBM_OCTAVES`, since density is
 recomputed procedurally at every sample. That product is the first thing to cut when adding
@@ -104,8 +107,9 @@ In rough order:
    scatters out of thin edges.
 3. Render at lower resolution with temporal reprojection, reusing the previous frame to afford
    more steps per pixel. `JITTER` in the shader is already the groundwork for this.
-4. Improve the sky and atmosphere: real Rayleigh and Mie scattering instead of a gradient, plus
-   aerial perspective on distant clouds.
+4. Improve the sky and atmosphere: real Rayleigh and Mie scattering instead of a gradient. Aerial
+   perspective on distant clouds is done; a spherical cloud shell instead of a flat slab would let
+   the layer drop below the horizon naturally rather than stopping at `MAX_DISTANCE`.
 5. Replace the noise field with a real fluid simulation.
 
 ## Working agreements
@@ -115,5 +119,5 @@ In rough order:
 - Keep tunable values as named constants at the top of the shader rather than inline numbers.
 - Be generous with logs, so a problem seen while running can be pasted back as text.
 - Keep this file current as the project changes.
-- Record fixed bugs in `COMPLETED_ISSUES.md`: the symptom, how it was tracked down, the root
-  cause, the fix, and anything tried that did not work.
+- Record fixed bugs in the commit message: the symptom, the root cause, the fix, and anything
+  tried that did not work.
