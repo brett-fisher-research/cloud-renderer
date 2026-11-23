@@ -232,6 +232,9 @@ trunk serve --release      # build, serve on http://localhost:8080, rebuild on s
 trunk build --release      # static files in dist/, hostable anywhere
 ```
 
+Live at https://clouds.brettfisher.dev, a Cloudflare Workers static-assets project (`wrangler.jsonc`).
+Deploy with `trunk build --release && npx wrangler deploy`.
+
 It has the window, the camera and the dials. Everything that needs an OS is compiled out with
 `cfg(target_arch = "wasm32")`: the command line, `--bench`, `--screenshot`, `--def`, and shader
 hot-reload (the shader is built into the binary, so `trunk serve` reloads the page instead).
