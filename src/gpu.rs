@@ -20,14 +20,17 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
 }
 
-/// Create an instance restricted to Vulkan, which is what Mesa/RADV exposes on
-/// this machine. Restricting the backend keeps the adapter list predictable.
+/// Create an instance on the platform's native graphics API: Vulkan on Linux,
+/// Metal on macOS, DX12 on Windows. wgpu is a portability layer, so the same
+/// Rust and WGSL run on all three. `PRIMARY` means "the first-class backends
+/// for this OS" and leaves out the GL fallback, which keeps the adapter list
+/// predictable.
 pub fn create_instance() -> wgpu::Instance {
-    log::info!("creating wgpu instance (Vulkan backend)");
+    log::info!("creating wgpu instance (native backend: Vulkan, Metal or DX12)");
     wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
-        // The display handle is only needed by the GL/WebGPU backends; Vulkan
-        // picks up the X11/Wayland connection from the surface itself.
+        backends: wgpu::Backends::PRIMARY,
+        // The display handle is only needed by the GL/WebGPU backends; the
+        // native ones pick up the window connection from the surface itself.
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     })
 }
@@ -42,9 +45,9 @@ impl Gpu {
         instance: wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'_>>,
     ) -> Result<Self> {
-        // Log everything we can see; this doubles as our "is the Vulkan driver
-        // working?" check, standing in for `vulkaninfo`.
-        for a in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN)) {
+        // Log everything we can see; this doubles as our "is the graphics
+        // driver working?" check, standing in for `vulkaninfo`.
+        for a in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY)) {
             let info = a.get_info();
             log::info!(
                 "available adapter: {:?} {} ({:?}, driver: {} {})",
@@ -57,13 +60,13 @@ impl Gpu {
         }
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            // Prefer the discrete GPU over the Raphael iGPU.
+            // Prefer a discrete GPU over an integrated one where there are both.
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface,
             ..Default::default()
         }))
-        .context("no suitable Vulkan adapter found (is mesa-vulkan-drivers installed?)")?;
+        .context("no suitable GPU adapter found (on Linux, is mesa-vulkan-drivers installed?)")?;
 
         let info = adapter.get_info();
         log::info!(

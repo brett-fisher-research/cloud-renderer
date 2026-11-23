@@ -19,7 +19,8 @@ buffers and draws one full-screen triangle twice: once for the clouds, once to p
 does no geometry, no scene graph and no per-pixel work.
 
 - `src/main.rs` — argument parsing, picks windowed or headless mode.
-- `src/gpu.rs` — wgpu instance, adapter, device and queue. Vulkan-only; logs every adapter it sees.
+- `src/gpu.rs` — wgpu instance, adapter, device and queue. Uses the platform's native backend
+  (Vulkan on Linux, Metal on macOS); logs every adapter it sees.
 - `src/noise.rs` — bakes the three tiling noise textures: cloud shape, edge detail, weather map.
 - `src/atmosphere.rs` — bakes the two sky tables: transmittance and multiple scattering.
 - `src/camera.rs` — look-around camera and the `Uniforms` struct sent to the GPU.
@@ -232,6 +233,14 @@ An effect is only real above 0.016 ms.
 
 Worst case found is 10.5 ms, 2.5 ms inside the budget. Cost follows how much of the screen is
 cloud surface: each ray that enters cloud takes a handful of short steps, each with a light march.
+
+On a Mac it runs on Metal, about 2.5 times slower: an Apple M5 Pro measures 14.1 ms for the
+default scene, 22.3 for overcast looking up, 7.5 sparse and 2.9 ground only, at 2560x1440. That
+is over the budget at 1440p; at 1920x1080 the default scene is about 8.5 ms. Apple GPUs do not run
+passes in recorded order, so their timestamp queries do not bracket a frame (they read 30 ms with
+a minimum of 0.00 for an 8.5 ms frame). On Metal `--bench` times each batch of eight frames on
+the wall clock instead, so its min and p95 are batch means, and the numbers are not comparable to
+the timestamp ones above to better than a few percent.
 
 Where the time goes, and the levers:
 

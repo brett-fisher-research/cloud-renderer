@@ -108,12 +108,31 @@ pub fn run(opts: &BenchOptions) -> Result<()> {
         let _ = batch;
     }
 
+    // Apple GPUs are tile-based deferred renderers: they do not run passes in
+    // the order recorded, so a pass's start and end timestamps do not bracket
+    // its work. Measured on an M5 Pro, the timestamps said 30 ms a frame (with
+    // a minimum of 0.00) where the batch took 8.5 ms a frame on the wall
+    // clock. On Metal, time each batch on the wall clock instead: submit,
+    // wait for the readback, divide by the frames in it. Nothing else is
+    // queued and nothing is presented, so that is GPU time plus a small fixed
+    // overhead. Each sample is then a batch mean, so min and p95 are coarser.
+    let wall_clock = gpu.adapter.get_info().backend == wgpu::Backend::Metal;
+    if wall_clock {
+        log::warn!("Metal: GPU timestamps are unreliable here, timing batches on the wall clock");
+    }
+
     let mut samples: Vec<f64> = Vec::with_capacity(opts.frames as usize);
     let wall = std::time::Instant::now();
     while samples.len() < opts.frames as usize {
+        let started = std::time::Instant::now();
         let batch = time_batch(&gpu, &mut renderer, &uniforms, &view, &query_set, &resolve, &readback)?;
+        let batch_ms = started.elapsed().as_secs_f64() * 1000.0 / BATCH as f64;
         for ticks in batch {
-            samples.push(ticks * period / 1.0e6); // ns -> ms
+            samples.push(if wall_clock {
+                batch_ms
+            } else {
+                ticks * period / 1.0e6 // ns -> ms
+            });
         }
     }
     let wall = wall.elapsed().as_secs_f64();
