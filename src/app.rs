@@ -251,7 +251,10 @@ impl App {
     /// Take the finished start-up and begin rendering, or report why not.
     fn install(&mut self, result: Result<Active>) {
         match result {
-            Ok(active) => {
+            Ok(mut active) => {
+                // On web the canvas can change size while start-up is still
+                // running, and those resize events had nobody to go to.
+                active.resize();
                 log::info!(
                     "controls: drag = look around, shift-drag = sun compass, \
                      scroll = sun elevation, Esc = quit"

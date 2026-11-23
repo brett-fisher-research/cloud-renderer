@@ -13,6 +13,10 @@
 //! window and the dials; the command line, the headless tools and shader
 //! hot-reload need a real OS and are compiled out (`cfg(target_arch)`).
 
+// The web build leaves out everything that only the native tools call, so
+// some fields and helpers go unused there. That is expected, not a smell.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
 mod app;
 mod atmosphere;
 #[cfg(not(target_arch = "wasm32"))]

@@ -2,7 +2,8 @@
 
 A small real-time volumetric cloud renderer in Rust, built as a graphics-programming learning
 project. A window shows a physically based sky over a flat plain, with a layer of sunlit cumulus
-drifting across it, casting shadows on the ground.
+drifting across it, casting shadows on the ground. The same program runs in a native window and,
+compiled to WebAssembly, in a browser tab.
 
 Brett is an experienced web developer and new to graphics programming. Introduce new graphics
 concepts briefly when they first appear, in replies and in code comments.
@@ -18,9 +19,9 @@ Opens a window, bakes five textures once at startup, and each frame writes two s
 buffers and draws one full-screen triangle twice: once for the clouds, once to present them. It
 does no geometry, no scene graph and no per-pixel work.
 
-- `src/main.rs` — argument parsing, picks windowed or headless mode.
+- `src/main.rs` — argument parsing, picks windowed or headless mode; the web entry point.
 - `src/gpu.rs` — wgpu instance, adapter, device and queue. Uses the platform's native backend
-  (Vulkan on Linux, Metal on macOS); logs every adapter it sees.
+  (Vulkan on Linux, Metal on macOS, WebGPU in a browser); logs every adapter it sees.
 - `src/noise.rs` — bakes the three tiling noise textures: cloud shape, edge detail, weather map.
 - `src/atmosphere.rs` — bakes the two sky tables: transmittance and multiple scattering.
 - `src/camera.rs` — look-around camera and the `Uniforms` struct sent to the GPU.
@@ -28,7 +29,8 @@ does no geometry, no scene graph and no per-pixel work.
 - `src/ui.rs` — the egui panel the dials are drawn on.
 - `src/renderer.rs` — pipelines, bindings, the history textures and per-frame temporal state,
   and shader compilation with hot-reload.
-- `src/app.rs` — winit event loop, mouse input, FPS counter.
+- `src/app.rs` — winit event loop, mouse input, FPS counter, start-up on both platforms.
+- `index.html` — the web build's page: a full-tab canvas and a loading line.
 - `src/screenshot.rs`, `src/bench.rs` — headless still and headless GPU-timed benchmark.
 - `src/defines.rs`, `src/watch.rs` — `--def` constant overrides and shader file watching.
 
@@ -218,6 +220,46 @@ compile, the error prints with the offending line and the last working version k
 After building anything that changes the image, run `tools/shots`, look at the sheet, and fix
 what looks wrong before reporting the work as done.
 
+## Web build
+
+The web build is the same binary compiled to WebAssembly (WASM: a compact bytecode browsers run
+at near-native speed) and drawing through WebGPU, the browser's version of the API wgpu wraps.
+The shader is identical; WGSL is WebGPU's own shading language.
+
+```sh
+brew install trunk && rustup target add wasm32-unknown-unknown    # once
+trunk serve --release      # build, serve on http://localhost:8080, rebuild on save
+trunk build --release      # static files in dist/, hostable anywhere
+```
+
+It has the window, the camera and the dials. Everything that needs an OS is compiled out with
+`cfg(target_arch = "wasm32")`: the command line, `--bench`, `--screenshot`, `--def`, and shader
+hot-reload (the shader is built into the binary, so `trunk serve` reloads the page instead).
+
+What differs from native, and why:
+
+- Start-up is async. A browser hands out the GPU through promises and never lets the main thread
+  block, so `Gpu::new` and `Renderer::new` are `async`. Native callers wrap them in
+  `pollster::block_on`; on web `App::resumed` spawns the set-up and `about_to_wait` collects it.
+- The noise bake is single-threaded, since a page cannot spawn threads without special server
+  headers. It takes about 2.3 s on an M5 Pro, during which the tab is frozen; `index.html` shows a
+  loading line that Rust removes on the first frame, or replaces with the error (usually a
+  browser without WebGPU). Baking with compute shaders (roadmap) would remove the wait.
+- Resolution is capped at 1920x1080's worth of pixels (`WEB_MAX_PIXELS` in `src/app.rs`). A tab
+  on a high-DPI screen is easily five million pixels. Above the cap the surface is smaller than
+  the canvas and the browser stretches it. The egui panel is told the surface's pixel density
+  (`render_scale` in `src/ui.rs`) so it stays the right size and the pointer still lines up.
+- A canvas has no sRGB surface format, so the passes draw into an sRGB *view* of it
+  (`target_format` in `src/app.rs`). Native surfaces are already sRGB and take the same path.
+- It needs WebGPU: Chrome, Edge, Brave and recent Safari. There is no WebGL fallback.
+
+Measured in headless Brave on an M5 Pro: 3.4 s from page load to first frame, then a steady
+60 fps at 1860x1115 (a 1728x1036 tab at 2x, capped) in the default scene. The `.wasm` is 6.9 MB.
+
+`tools/` only drives the native binary. A change to the Rust side should be built for both
+targets (`cargo build --release --target wasm32-unknown-unknown` is the quick check) before it
+is called done.
+
 ## Performance
 
 The target is 60 fps at 2560x1440, so the frame is budgeted at 13 ms. Measured on an AMD
@@ -265,8 +307,8 @@ In rough order:
    terraces. Rendering the clouds at half resolution is the larger version of the same idea.
 3. More cloud types: a second, higher layer of thin cirrus, and anvil tops for the tallest
    cumulus. Both are a profile and a weather-map channel, not new machinery.
-4. Bake the textures with compute shaders. Worth half a second of startup, and it would put the
-   noise back where it can hot-reload.
+4. Bake the textures with compute shaders. Worth half a second of startup natively and over two
+   seconds of frozen tab on the web, and it would put the noise back where it can hot-reload.
 5. A ground worth looking at: terrain, or at least texture.
 6. Replace the noise field with a real fluid simulation.
 

@@ -82,7 +82,14 @@ impl Ui {
         params: &mut Params,
         fps: f32,
     ) {
-        let raw_input = self.state.take_egui_input(window);
+        let mut raw_input = self.state.take_egui_input(window);
+        // egui-winit reports positions in window points (CSS pixels on web),
+        // which stays right. What changes when the surface is smaller than
+        // the window is how many surface pixels one point covers, so tell
+        // egui that density and it lays out and rasterises text to match.
+        if let Some(viewport) = raw_input.viewports.get_mut(&raw_input.viewport_id) {
+            viewport.native_pixels_per_point = Some(window.scale_factor() as f32 * render_scale);
+        }
 
         let mut reset = false;
         let full_output = self.ctx.run_pass(raw_input, |ctx| {
@@ -157,9 +164,7 @@ impl Ui {
 
         // Turn egui's shapes into triangles, then hand them to the GPU. Fonts
         // and icons arrive as texture deltas that have to be applied first.
-        // egui lays out in window points, so pointer positions keep matching;
-        // only the triangles are scaled to the surface actually drawn into.
-        let pixels_per_point = self.ctx.pixels_per_point() * render_scale;
+        let pixels_per_point = self.ctx.pixels_per_point();
         let primitives = self.ctx.tessellate(full_output.shapes, pixels_per_point);
         for (id, deltas) in &full_output.textures_delta.set {
             // One texture can arrive as several partial updates in a frame.

@@ -1,0 +1,50 @@
+<!doctype html>
+<!--
+  The web build's page. `trunk serve --release` compiles the crate to
+  WebAssembly, injects the script that loads it, and serves this file.
+  The Rust side looks up two elements by id: #canvas to draw on, and
+  #loading, which it removes once the first frame is ready (or fills with
+  the error if start-up fails).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cloud-renderer</title>
+    <link data-trunk rel="rust" data-bin="cloud-renderer" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #6f93c4;
+      }
+      /* The canvas fills the tab. Its drawing resolution is set from Rust
+         and may be lower; the browser stretches it to this size. */
+      #canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+        touch-action: none;
+      }
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        padding: 16px;
+        text-align: center;
+        font: 16px/1.5 system-ui, sans-serif;
+        color: #fff;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <!-- The noise bake blocks the page for a few seconds, so this text has
+         to be on screen before the WebAssembly starts. -->
+    <div id="loading">Baking clouds… this takes a few seconds.</div>
+  </body>
+</html>
