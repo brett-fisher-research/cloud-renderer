@@ -292,6 +292,17 @@ Dropped: rendering at lower resolution with temporal reprojection. It existed to
 and the textures bought ten times more without the reprojection artifacts or a second render
 target. `JITTER` stays for what it already does.
 
+## Worktrees
+
+Every Claude session that changes files works in its own git worktree, so parallel sessions never
+share a checkout.
+
+- At the start of a session, before the first edit, enter a worktree with the `EnterWorktree`
+  tool. A session already launched with `claude -w` is in one.
+- Worktrees live in `.claude/worktrees/<name>`, which is gitignored. Create them there and nowhere
+  else.
+- Read-only sessions, such as answering a question about the code, can stay in the main checkout.
+
 ## Working agreements
 
 - Build in small steps and get each one running before starting the next.
