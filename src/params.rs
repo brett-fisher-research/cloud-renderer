@@ -24,7 +24,8 @@ pub struct Params {
     /// How much of the sky is cloud. 0 = clear, 1 = solid overcast.
     pub coverage: f32,
     /// Size of the largest noise features in metres: how *big* the clouds are.
-    /// Small = busy popcorn, large = continental masses.
+    /// Small = busy popcorn, large = continental masses. The bottom of the
+    /// range is limited by the baked noise texture; see `FEATURE_SIZE_RANGE`.
     pub feature_size: f32,
     /// Scales self-shadowing. Below 1.0 fakes the extra brightness real clouds
     /// get from light bouncing around inside them, which single scattering does
@@ -49,7 +50,13 @@ impl Default for Params {
 /// command-line clamping agree.
 impl Params {
     pub const COVERAGE_RANGE: std::ops::RangeInclusive<f32> = 0.0..=1.0;
-    pub const FEATURE_SIZE_RANGE: std::ops::RangeInclusive<f32> = 300.0..=10000.0;
+    /// The floor used to be 300 m. The noise is now a tiling 3D texture whose
+    /// tile is four times the feature size, so a small feature size means a
+    /// short repeat — at 300 m the field wraps every 1.2 km, which across a
+    /// 50 km view is forty repeats and reads as a radial moiré at the horizon.
+    /// 1500 m is where that stops being noticeable. Getting the bottom of the
+    /// range back means breaking the repeat up, not a bigger texture.
+    pub const FEATURE_SIZE_RANGE: std::ops::RangeInclusive<f32> = 1500.0..=10000.0;
     pub const SHADOW_STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
     pub const EXPOSURE_RANGE: std::ops::RangeInclusive<f32> = 0.1..=4.0;
 }

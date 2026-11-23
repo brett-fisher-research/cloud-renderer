@@ -72,8 +72,18 @@ impl Renderer {
         // texture fetch replaces dozens of hash-and-interpolate instructions,
         // and the GPU's texture units do the trilinear blend in fixed-function
         // hardware, in parallel with the shader's arithmetic.
-        let noise_base = noise::bake_fbm(device, &gpu.queue, "noise base", 256, 7);
-        let noise_detail = noise::bake_fbm(device, &gpu.queue, "noise detail", 32, 3);
+        // The base tile is four times the feature size, so the loudest octave
+        // is the third. See `bake_fbm` for why the stack peaks there instead
+        // of falling off from the start.
+        let noise_base = noise::bake_fbm(
+            device,
+            &gpu.queue,
+            "noise base",
+            256,
+            &[0.25, 0.4, 0.5, 0.25, 0.125, 0.0625, 0.03125],
+        );
+        let noise_detail =
+            noise::bake_fbm(device, &gpu.queue, "noise detail", 64, &[0.5, 0.25, 0.125, 0.0625]);
         let base_view = noise_base.create_view(&wgpu::TextureViewDescriptor::default());
         let detail_view = noise_detail.create_view(&wgpu::TextureViewDescriptor::default());
 

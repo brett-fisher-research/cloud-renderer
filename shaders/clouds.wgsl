@@ -43,10 +43,23 @@ const EXTINCTION: f32 = 0.004;      // per metre: how fast cloud blocks light
 
 // --- Noise shaping ---
 // The size of the largest noise features is a live dial: `p.feature_size`.
-const FBM_OCTAVES: i32 = 5;         // layers of detail; cost scales with this
-const FBM_GAIN: f32 = 0.5;          // how much quieter each octave is
-const FBM_LACUNARITY: f32 = 2.02;
-const TILE_SCALE: f32 = 4.0;   // how much finer each octave is
+// The shape of the field itself — how many octaves, how fast they fall off —
+// is baked into a texture before the first frame, so those constants live in
+// `src/noise.rs` rather than here, and changing them needs a rebuild rather
+// than a save. The two below control how the baked field is *used*, and still
+// hot-reload like everything else.
+
+// How wide the base texture's tile is, as a multiple of the feature size.
+// The tile has to be several times the clouds or its repeat is obvious; the
+// bake compensates by making the feature-size octave the loudest, so the
+// clouds stay compact. Four is the smallest that hides the repeat here.
+const TILE_SCALE: f32 = 4.0;
+
+// Detail. A second, finer read that erodes the base's edges. Scaled by a
+// prime: at 2, 4 or 8 the two lattices would line up and the erosion would
+// reinforce the base's own grid rather than break it up.
+const DETAIL_SCALE: f32 = 11.0;
+const DETAIL_STRENGTH: f32 = 0.45;
 
 // How much of the sky is cloud is a live dial: `p.coverage`.
 // Where in the slab the cloud sits: fractions of the layer height.
@@ -220,38 +233,6 @@ fn slab_intersect(origin: vec3<f32>, dir: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(t_enter, t_exit);
 }
 
-
-// ---------------------------------------------------------------------------
-//  Baked noise: octaves of the field precomputed into tiling 3D textures.
-//  One filtered fetch in fixed-function hardware replaces several octaves of
-//  hash-and-interpolate arithmetic.
-// ---------------------------------------------------------------------------
-@group(0) @binding(2) var noise_base: texture_3d<f32>;
-@group(0) @binding(3) var noise_detail: texture_3d<f32>;
-@group(0) @binding(4) var noise_sampler: sampler;
-
-// The detail texture stands in for octaves 3-5, so its tile is a quarter of
-// the feature size: the frequency octave 3 had.
-const DETAIL_SCALE: f32 = 4.0;
-const COARSE_WEIGHT: f32 = 0.75;    // summed amplitudes of octaves 1-2
-const DETAIL_WEIGHT: f32 = 0.21875; // summed amplitudes of octaves 3-5
-
-// Used only by the all-baked variants.
-const BASE_DETAIL_SCALE: f32 = 7.0;
-const DETAIL_STRENGTH: f32 = 0.35;
-
-fn baked_noise(q: vec3<f32>, detail: bool) -> f32 {
-    // textureSampleLevel, not textureSample: the raymarch loop has breaks in
-    // it, so it is not uniform control flow, and implicit-derivative sampling
-    // is illegal there. There are no mips anyway, so level 0 is all there is.
-    var n = textureSampleLevel(noise_base, noise_sampler, q, 0.0).r;
-    if (detail) {
-        let d = textureSampleLevel(noise_detail, noise_sampler, q * BASE_DETAIL_SCALE, 0.0).r;
-        n = n - (1.0 - n) * d * DETAIL_STRENGTH;
-    }
-    return n;
-}
-
 // ---------------------------------------------------------------------------
 //  Noise
 //
@@ -260,9 +241,23 @@ fn baked_noise(q: vec3<f32>, detail: bool) -> f32 {
 //  layer adds wispier detail at half the amplitude. The sum is called fBm
 //  (fractional Brownian motion).
 //
-//  This is all computed per sample, which is simple but expensive. The
-//  roadmap replaces it with noise baked into a 3D texture by a compute shader.
+//  That sum used to be computed here, at every one of the hundreds of samples
+//  a pixel takes, and it was 94% of the frame. It is now baked once into two
+//  tiling 3D textures by `src/noise.rs`, so a sample is a single filtered
+//  fetch. The GPU's texture units do the three-way blend in fixed-function
+//  hardware, in parallel with the shader's arithmetic, which is most of why
+//  this is now nearly free.
+//
+//  A 3D texture is a 2D one with a third coordinate: a cube of voxels, read
+//  with trilinear filtering. Both of ours *tile*, so one cube covers the whole
+//  sky — the sampler's Repeat address mode wraps any coordinate outside 0..1,
+//  and the bake hashes each octave's lattice modulo that octave's frequency so
+//  the far face of the cube lines up with the near one.
 // ---------------------------------------------------------------------------
+
+@group(0) @binding(2) var noise_base: texture_3d<f32>;
+@group(0) @binding(3) var noise_detail: texture_3d<f32>;
+@group(0) @binding(4) var noise_sampler: sampler;
 
 // "Interleaved gradient noise": a cheap screen-space dither that looks evenly
 // scattered rather than streaky. It depends only on the pixel coordinate, so
@@ -272,62 +267,54 @@ fn dither(pixel: vec2<f32>) -> f32 {
     return fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))));
 }
 
-// Hash a 3D grid cell to a pseudo-random number in [0,1).
-// This is the standard "hash without sine" trick: multiply into a fractional
-// range, mix the components together, and keep the fractional part.
-fn hash13(p_in: vec3<f32>) -> f32 {
-    var p = fract(p_in * 0.1031);
-    p += dot(p, p.zyx + 31.32);
-    return fract((p.x + p.y) * p.z);
-}
-
-// Smooth value noise: random values on an integer lattice, interpolated.
-fn value_noise(p: vec3<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    // Smoothstep the interpolation weights so the result has no visible
-    // creases where it crosses a cell boundary.
-    let w = f * f * (3.0 - 2.0 * f);
-
-    let n000 = hash13(i + vec3<f32>(0.0, 0.0, 0.0));
-    let n100 = hash13(i + vec3<f32>(1.0, 0.0, 0.0));
-    let n010 = hash13(i + vec3<f32>(0.0, 1.0, 0.0));
-    let n110 = hash13(i + vec3<f32>(1.0, 1.0, 0.0));
-    let n001 = hash13(i + vec3<f32>(0.0, 0.0, 1.0));
-    let n101 = hash13(i + vec3<f32>(1.0, 0.0, 1.0));
-    let n011 = hash13(i + vec3<f32>(0.0, 1.0, 1.0));
-    let n111 = hash13(i + vec3<f32>(1.0, 1.0, 1.0));
-
-    // Trilinear interpolation between the eight corners of the cell.
-    let x00 = mix(n000, n100, w.x);
-    let x10 = mix(n010, n110, w.x);
-    let x01 = mix(n001, n101, w.x);
-    let x11 = mix(n011, n111, w.x);
-    return mix(mix(x00, x10, w.y), mix(x01, x11, w.y), w.z);
-}
-
-// Sum several octaves of value noise. Result is normalised to roughly [0,1].
-fn fbm(p_in: vec3<f32>) -> f32 {
-    var p = p_in;
-    var amplitude = 0.5;
-    var total = 0.0;
-    var norm = 0.0;
-
-    for (var i = 0; i < FBM_OCTAVES; i = i + 1) {
-        total += amplitude * value_noise(p);
-        norm += amplitude;
-        p *= FBM_LACUNARITY;
-        amplitude *= FBM_GAIN;
-        // Offset each octave so the lattices do not line up and produce a
-        // visible grid.
-        p += vec3<f32>(17.3, 9.1, 23.7);
+// Sample the baked noise field. `q` is in tile units: 1.0 is one full wrap of
+// the base texture.
+//
+// `detail` buys crisper, wispier edges for the price of a second fetch. The
+// light march leaves it off: a shadow is an integral of density along a line,
+// and detail that fine averages out of it long before it reaches the eye.
+// `lod` is a mip level for each texture: x for the base, y for the detail.
+// See `mip_for_step`.
+fn cloud_noise(q: vec3<f32>, lod: vec2<f32>, detail: bool) -> f32 {
+    // textureSampleLevel rather than textureSample: the raymarch loop breaks
+    // out early, so it is not uniform control flow, and a sample that works
+    // out its own mip level from screen-space derivatives is illegal there.
+    // Which suits us, because the right level here has nothing to do with
+    // screen space and everything to do with how long a march step is.
+    var n = textureSampleLevel(noise_base, noise_sampler, q, lod.x).r;
+    if (detail) {
+        let d = textureSampleLevel(noise_detail, noise_sampler, q * DETAIL_SCALE, lod.y).r;
+        // Erode inwards from the edges: push hardest where the base is
+        // already thin and not at all where it is solid, which tears a smooth
+        // blob into something with wisps on it.
+        //
+        // `d - 0.5`, not `d`: the detail field averages 0.5, so subtracting it
+        // outright would drag the whole field down and quietly shift what the
+        // coverage dial means. Centring it on zero adds detail without moving
+        // the average, so coverage keeps the meaning the bake gave it.
+        n -= (1.0 - n) * (d - 0.5) * DETAIL_STRENGTH;
     }
+    return n;
+}
 
-    return total / norm;
+// Which mip level of each noise texture a march of `step` metres should read.
+//
+// A step of `step` metres covers `step / voxel_size` voxels, and each mip
+// level up doubles the size of a voxel, so the level that makes one step
+// about one voxel wide is the base-2 log of that ratio. Below level 0 there
+// is nothing more to show, hence the max.
+fn mip_for_step(step: f32) -> vec2<f32> {
+    let tile = dials.feature_size * TILE_SCALE;
+    let base_voxel = tile / f32(textureDimensions(noise_base, 0).x);
+    let detail_voxel = tile / (DETAIL_SCALE * f32(textureDimensions(noise_detail, 0).x));
+    return vec2<f32>(
+        max(0.0, log2(step / base_voxel)),
+        max(0.0, log2(step / detail_voxel)),
+    );
 }
 
 // Density of the cloud medium at a world-space point.
-fn cloud_density(p: vec3<f32>) -> f32 {
+fn cloud_density_at(p: vec3<f32>, lod: vec2<f32>, detail: bool) -> f32 {
     // Height through the layer, 0 at the bottom and 1 at the top.
     let h = (p.y - CLOUD_BOTTOM) / (CLOUD_TOP - CLOUD_BOTTOM);
     if (h < 0.0 || h > 1.0) {
@@ -344,15 +331,23 @@ fn cloud_density(p: vec3<f32>) -> f32 {
     let drift = WIND * u.time;
     let q = (p + drift) / (dials.feature_size * TILE_SCALE);
 
-    let n = textureSampleLevel(noise_base, noise_sampler, q, 0.0).r;
+    let n = cloud_noise(q, lod, detail);
 
     // Coverage: everything below the threshold becomes clear sky, and what
     // remains is rescaled back to [0,1] so the clouds keep their full density
     // instead of thinning out as coverage drops.
+    //
+    // The bake flattened the field's histogram, so this dial is close to
+    // literal: 0.45 means about 45% of the layer is above the threshold.
     let threshold = 1.0 - dials.coverage;
     let shaped = clamp((n - threshold) / max(dials.coverage, 0.001), 0.0, 1.0);
 
     return shaped * profile * DENSITY;
+}
+
+// The view ray wants every bit of detail the step length can carry.
+fn cloud_density(p: vec3<f32>, lod: vec2<f32>) -> f32 {
+    return cloud_density_at(p, lod, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +378,8 @@ fn cloud_phase(cos_theta: f32) -> f32 {
 // way (the "optical depth"), then apply Beer's law once: exp(-depth). Steps
 // get longer as they go, because distant blockers matter less than nearby
 // ones and this buys depth cheaply. Six steps is enough to read as shadowing.
-fn light_march(p: vec3<f32>) -> f32 {
+// These samples skip the detail texture: see `cloud_noise`.
+fn light_march(p: vec3<f32>, lod: vec2<f32>) -> f32 {
     var optical_depth = 0.0;
     var t = 0.0;
     var step = LIGHT_STEP_SIZE;
@@ -391,7 +387,7 @@ fn light_march(p: vec3<f32>) -> f32 {
     for (var i = 0; i < LIGHT_STEPS; i = i + 1) {
         // Sample at the middle of the step.
         let sp = p + u.sun_dir * (t + step * 0.5);
-        optical_depth += cloud_density(sp) * step;
+        optical_depth += cloud_density_at(sp, lod, false) * step;
         t += step;
         step *= LIGHT_STEP_GROWTH;
     }
@@ -435,8 +431,15 @@ fn march_clouds(
     // after a handful of samples.
     let dt = (hit.y - hit.x) / f32(PRIMARY_STEPS);
 
-    // The view-to-sun angle is the same for every sample along this ray, so
-    // the phase function only needs evaluating once per pixel.
+    // Both of these are the same for every sample along this ray, so they are
+    // worked out once per pixel rather than once per step: the mip level
+    // follows from the step length, and the phase function from the angle
+    // between the view ray and the sun.
+    let lod = mip_for_step(dt);
+    // The shadow march's own steps start shorter than the view ray's, so it
+    // can afford a sharper level, but never a sharper one than the view ray
+    // is using — detail the eye cannot see has no business casting a shadow.
+    let light_lod = min(lod, mip_for_step(LIGHT_STEP_SIZE));
     let phase = cloud_phase(dot(dir, u.sun_dir));
 
     // Where in the first step this pixel starts sampling.
@@ -449,7 +452,7 @@ fn march_clouds(
         let t = hit.x + (f32(i) + offset) * dt;
         let p = origin + dir * t;
 
-        let density = cloud_density(p);
+        let density = cloud_density(p, lod);
         if (density <= 0.0) {
             continue;
         }
@@ -458,7 +461,7 @@ fn march_clouds(
         let step_transmittance = exp(-sigma * dt);
 
         // How much sun reaches this point through the cloud above it.
-        let sun_visibility = light_march(p);
+        let sun_visibility = light_march(p, light_lod);
         let sunlight = SUN_LIGHT * SUN_LIGHT_INTENSITY * sun_visibility * phase;
 
         // Skylight, dimmed towards the base where less of the dome is visible.

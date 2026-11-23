@@ -19,6 +19,7 @@ geometry, no scene graph and no per-pixel work.
 
 - `src/main.rs` — argument parsing, picks windowed or headless mode.
 - `src/gpu.rs` — wgpu instance, adapter, device and queue. Vulkan-only; logs every adapter it sees.
+- `src/noise.rs` — bakes the tiling 3D noise textures the shader samples, once at startup.
 - `src/camera.rs` — look-around camera and the `Uniforms` struct sent to the GPU.
 - `src/params.rs` — the four live-tunable cloud dials and their slider ranges.
 - `src/ui.rs` — the egui panel those dials are drawn on.
@@ -39,8 +40,10 @@ The fragment shader, per pixel:
 2. Colours the sky: a zenith-to-horizon gradient, a warm low-sun tint, and a halo around the sun.
    There is deliberately no sun disc; a hard-edged circle read as pasted on over the soft clouds.
 3. Intersects the ray with a horizontal slab between `CLOUD_BOTTOM` and `CLOUD_TOP`.
-4. Raymarches that slab in `PRIMARY_STEPS` steps, sampling density from fBm value noise shaped by
-   a coverage threshold and a vertical profile, scrolled over time by `WIND`.
+4. Raymarches that slab in `PRIMARY_STEPS` steps, sampling density from two tiling 3D noise
+   textures shaped by a coverage threshold and a vertical profile, scrolled over time by `WIND`.
+   The mip level comes from the step length, not from screen space, which is what keeps distant
+   cloud from fizzing.
 5. At each sample, marches `LIGHT_STEPS` towards the sun and applies Beer's law to find how much
    sunlight arrives, then weights it by a two-lobe Henyey-Greenstein phase function and adds
    ambient skylight.
@@ -59,6 +62,13 @@ The fragment shader, per pixel:
   wrong, which is why a fifth dial means adding three more to keep the size a multiple of 16.
 - The params uniform is named `dials` in the shader, not `p`, because `cloud_density` already uses
   `p` for the sample point.
+- `@group(0)` carries the two uniform buffers at bindings 0 and 1 and the noise at 2, 3 and 4:
+  base texture, detail texture, shared sampler. The sampler's address mode is `Repeat`, which is
+  what lets one cube of noise cover the sky.
+- The *shape* of the noise field — octave count and the amplitude of each — lives in
+  `src/noise.rs`, because it is baked before the first frame. Changing it needs a rebuild, not a
+  save. How the field is *used* (`TILE_SCALE`, `DETAIL_SCALE`, `DETAIL_STRENGTH`) is still shader
+  constants and still hot-reloads.
 
 ## Running it
 
@@ -78,7 +88,9 @@ raise or lower the sun, Esc to quit. The title bar shows frame rate, resolution 
 frame rate is also logged every two seconds.
 
 A panel in the top-left has sliders for the four dials that change the look the most: **coverage**
-(how much of the sky is cloud), **feature size** (how big the clouds are), **shadow** (how strongly
+(how much of the sky is cloud, now close to literal — 0.45 means about 45% of the layer is above
+the cloud threshold), **feature size** (how big the clouds are; the floor is 1500 m because of the
+noise texture's repeat, see the roadmap), **shadow** (how strongly
 they shadow themselves — low fakes the multiple scattering that keeps real clouds bright) and
 **exposure** (overall brightness). The panel swallows mouse input while the pointer is over it, so
 dragging a slider does not also spin the camera.
@@ -121,73 +133,76 @@ re-measured after a change. It reports median, min, p95 and mean; the median is 
 quote. Its 1280x720 reading agrees with the hand-timed `--no-vsync` numbers below to within a
 rounding error, which is what first validated it.
 
-Measured on an AMD RX 7800 XT (RADV, Mesa 24.2.8). Stages at 1280x720:
+Measured on an AMD RX 7800 XT (RADV, Mesa 24.2.8). The expensive view is not the default one:
+looking up at high coverage, long slanted rays cross the whole slab and nothing terminates early.
 
-| Stage | Frame time |
-| --- | --- |
-| Sky only | ~0.1 ms |
-| Noise clouds, no lighting | 2.3 ms |
-| With sun light march | 7.8 ms |
-| With aerial perspective | 8.0 ms |
-| With the dial panel | 8.0 ms |
+| | 1920x1080 | 2560x1440 | 3840x2160 |
+| --- | --- | --- | --- |
+| Default view (coverage 0.45) | 2.1 ms | 3.6 ms | 7.7 ms |
+| Worst case (coverage 0.85, pitch 0.55) | 4.0 ms (248 fps) | 6.8 ms (147 fps) | 14.5 ms (69 fps) |
 
-Reading the four dials from a uniform instead of a `const` and drawing the egui panel are both
-free at this resolution: 8.03 ms measured against the 8.0 ms baseline. Constants that the compiler
-could fold are worth keeping as constants anyway, but the cost of promoting one is not the reason.
+Coverage barely matters any more: 2.1 ms for clear sky against 3.3 ms for solid overcast at
+1920x1080. It used to be the dial that decided whether the frame fit in its budget.
 
-Cost is per pixel, so it scales with the pixel count: the full renderer costs 8.0 ms at 1280x720,
-17 ms (~59 fps) at 1920x1080, and 26-31 ms (~32-39 fps) at 2560x1440. 1920x1080 is the largest
-size that still holds 60 fps on this card, which is why it is the default.
+### How it got here
 
-Cost scales with `PRIMARY_STEPS` times `LIGHT_STEPS` times `FBM_OCTAVES`, since density is
-recomputed procedurally at every sample. That product is the first thing to cut when adding
-expensive effects.
+It was ten times slower. The frame cost 16.4 ms at 1920x1080 in the default view — against a
+16.7 ms vsync budget, so the GPU never idled — and 33.7 ms looking up at coverage 0.85.
 
-### Where the frame actually goes
-
-Measured with `--bench` at 1920x1080 by deleting one piece of work at a time. The scene is
-coverage 0.70, which is the expensive one: clear sky has nothing to march, and solid overcast
-hits `MIN_TRANSMITTANCE` and stops early, so the worst case is in between.
+`--bench` found where it went, by deleting one piece of work at a time at coverage 0.70:
 
 | Frame as built | 24.1 ms |
 | --- | --- |
 | ...with the sun light march removed | 4.3 ms |
 | ...with the noise replaced by a constant | 1.5 ms |
 
-So **94% of the frame is value noise, and 82% of it is noise evaluated inside the light march**.
-Everything else together — sky, ray setup, the compositing loop, tone mapping — is 1.5 ms.
+**94% of the frame was value noise, and 82% of it was noise inside the light march.** Everything
+else together — sky, ray setup, the compositing loop, tone mapping — was 1.5 ms. The fix had to
+be the noise or it was not worth doing.
 
-The worst case is not the default view. Looking up at coverage 0.85, where long slanted rays
-cross the whole slab and nothing terminates early:
+Baking it into 3D textures did it: worst case 33.7 ms to 4.0 ms. A sample is now one filtered
+fetch, done by the texture units in fixed-function hardware alongside the shader's arithmetic,
+instead of five octaves of hash-and-interpolate. Two further things fell out of it that were not
+available before: mip levels chosen from the step length, which prefilter distant cloud instead
+of letting it alias, and a flattened histogram, which makes the coverage dial close to literal.
 
-| | 1920x1080 | 2560x1440 | 3840x2160 |
-| --- | --- | --- | --- |
-| Worst case (coverage 0.85, pitch 0.55) | 33.7 ms (30 fps) | 59.8 ms (17 fps) | 134 ms (7 fps) |
+Things measured and rejected along the way, all recorded so they are not retried:
 
-This is why the GPU sits at 100%: at 1920x1080 the default view costs 16.4 ms against a 16.7 ms
-vsync budget, so the card never gets to idle, and any view worse than the default drops frames.
+- **Adaptive empty-space skipping** (23.2 ms) and **a cheap probe before the full fBm** (23.9 ms),
+  both worth about 4%. Empty space was never where the time went; the light march was, and it
+  only runs where there is already cloud.
+- **Cheaper noise in the shadow march alone**, 5 octaves down to 2: 33.7 ms to 17.9 ms, and
+  visually almost free. A good change, made redundant by the textures.
+- **A hybrid** keeping the coarse octaves procedural and baking only the fine ones. It solves
+  tiling but only reaches 11.2 ms, because the coarse procedural octaves were most of the cost.
 
-Two things that *look* like the answer and are not, both measured and both worth about 4%:
-empty-space skipping with a coarse/fine adaptive march (23.2 ms), and a cheap 2-octave probe to
-reject clear sky before running the full fBm (23.9 ms). Neither helps, because empty space is
-not where the time goes — the light march is, and it only ever runs where there is already
-cloud.
+Cost now scales with `PRIMARY_STEPS` times `LIGHT_STEPS`, and barely with the noise at all. There
+is roughly four times the frame budget spare at 1920x1080, which is where the quality in the
+roadmap below can be spent.
 
 ## Roadmap
 
 In rough order:
 
-1. Bake Worley and Perlin-Worley noise into 3D textures with a compute shader. This replaces the
-   per-sample fBm, which is both the main cost and the reason the clouds look soft rather than
-   billowy.
-2. Add a powder effect, darkening the parts of a cloud facing the sun to capture the way light
-   scatters out of thin edges.
-3. Render at lower resolution with temporal reprojection, reusing the previous frame to afford
-   more steps per pixel. `JITTER` in the shader is already the groundwork for this.
+1. Spend the frame budget the textures freed on quality: more `PRIMARY_STEPS` and `LIGHT_STEPS`,
+   and a powder effect darkening the parts of a cloud facing the sun, for the way light scatters
+   out of thin edges.
+2. Break up the texture's repeat, so the feature-size dial can go back below 1500 m. The field
+   tiles every four feature sizes, and at small sizes that repeat reads as a radial moiré at the
+   horizon. A per-cell offset on the lookup, or a cheap procedural warp of the sample point, is
+   the usual answer — not a bigger texture.
+3. Bake the noise with a compute shader instead of on the CPU. Worth 350 ms of startup, and it
+   would put the noise field back in the shader where it can hot-reload. The field itself could
+   become Worley or Perlin-Worley at the same time, which is what makes clouds look billowy
+   rather than soft; it costs nothing at runtime now that it is baked.
 4. Improve the sky and atmosphere: real Rayleigh and Mie scattering instead of a gradient. Aerial
    perspective on distant clouds is done; a spherical cloud shell instead of a flat slab would let
    the layer drop below the horizon naturally rather than stopping at `MAX_DISTANCE`.
 5. Replace the noise field with a real fluid simulation.
+
+Dropped: rendering at lower resolution with temporal reprojection. It existed to buy frame budget,
+and the textures bought ten times more without the reprojection artifacts or a second render
+target. `JITTER` stays for what it already does.
 
 ## Working agreements
 
