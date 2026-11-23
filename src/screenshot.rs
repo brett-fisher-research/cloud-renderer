@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::camera::Camera;
 use crate::gpu::{create_instance, Gpu};
+use crate::params::Params;
 use crate::renderer::Renderer;
 
 pub const WIDTH: u32 = 1280;
@@ -20,6 +21,7 @@ pub struct ShotOptions {
     pub sun_elevation: Option<f32>,
     pub yaw: Option<f32>,
     pub pitch: Option<f32>,
+    pub params: Params,
 }
 
 pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
@@ -62,7 +64,15 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
         camera.sun_elevation,
         opts.time
     );
+    log::info!(
+        "dials: coverage {:.2}, feature size {:.0} m, shadow {:.2}, exposure {:.2}",
+        opts.params.coverage,
+        opts.params.feature_size,
+        opts.params.shadow_strength,
+        opts.params.exposure
+    );
     renderer.update(&gpu, &camera.uniforms(WIDTH, HEIGHT, opts.time));
+    renderer.update_params(&gpu, &opts.params);
 
     // GPU texture rows must start on a 256-byte boundary when copied to a
     // buffer, so the readback buffer may be wider than the image itself.

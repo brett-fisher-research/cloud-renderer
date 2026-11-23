@@ -13,6 +13,7 @@ use winit::window::{Window, WindowId};
 
 use crate::camera::Camera;
 use crate::gpu::{Gpu, create_instance};
+use crate::params::Params;
 use crate::renderer::Renderer;
 use crate::watch;
 
@@ -32,6 +33,8 @@ pub struct App {
     /// false = present as fast as the GPU can, for benchmarking.
     vsync: bool,
     camera: Camera,
+    /// The four live cloud dials, driven by the on-screen panel.
+    params: Params,
     start: Instant,
 
     // Input state.
@@ -51,6 +54,7 @@ impl App {
             active: None,
             vsync: true,
             camera: Camera::default(),
+            params: Params::default(),
             start: Instant::now(),
             dragging: false,
             last_cursor: None,
@@ -61,13 +65,14 @@ impl App {
         }
     }
 
-    pub fn run(vsync: bool) -> Result<()> {
+    pub fn run(vsync: bool, params: Params) -> Result<()> {
         let event_loop = EventLoop::new().context("failed to create event loop")?;
         // Poll (rather than Wait) so we render continuously — the clouds drift
         // even when there is no input.
         event_loop.set_control_flow(ControlFlow::Poll);
         let mut app = Self::new();
         app.vsync = vsync;
+        app.params = params;
         event_loop.run_app(&mut app).context("event loop failed")?;
         Ok(())
     }
@@ -106,6 +111,7 @@ impl App {
             .camera
             .uniforms(active.config.width, active.config.height, t);
         active.renderer.update(&active.gpu, &uniforms);
+        active.renderer.update_params(&active.gpu, &self.params);
 
         let mut encoder =
             active

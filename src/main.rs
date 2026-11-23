@@ -11,6 +11,7 @@
 mod app;
 mod camera;
 mod gpu;
+mod params;
 mod renderer;
 mod screenshot;
 mod watch;
@@ -24,6 +25,9 @@ struct Args {
     yaw: Option<f32>,
     pitch: Option<f32>,
     vsync: bool,
+    /// Starting values for the four live dials. In windowed mode these are just
+    /// where the sliders begin; headlessly they are the whole story.
+    params: params::Params,
 }
 
 fn parse_args() -> Result<Args> {
@@ -34,6 +38,7 @@ fn parse_args() -> Result<Args> {
         yaw: None,
         pitch: None,
         vsync: true,
+        params: params::Params::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -57,6 +62,25 @@ fn parse_args() -> Result<Args> {
                 let v = it.next().context("--pitch needs a number (radians)")?;
                 args.pitch = Some(v.parse().with_context(|| format!("bad --pitch: {v}"))?);
             }
+            "--coverage" => {
+                let v = it.next().context("--coverage needs a number (0..1)")?;
+                args.params.coverage = v.parse().with_context(|| format!("bad --coverage: {v}"))?;
+            }
+            "--feature-size" => {
+                let v = it.next().context("--feature-size needs a number (metres)")?;
+                args.params.feature_size = v
+                    .parse()
+                    .with_context(|| format!("bad --feature-size: {v}"))?;
+            }
+            "--shadow" => {
+                let v = it.next().context("--shadow needs a number (0..2)")?;
+                args.params.shadow_strength =
+                    v.parse().with_context(|| format!("bad --shadow: {v}"))?;
+            }
+            "--exposure" => {
+                let v = it.next().context("--exposure needs a number (0.1..4)")?;
+                args.params.exposure = v.parse().with_context(|| format!("bad --exposure: {v}"))?;
+            }
             "--no-vsync" => args.vsync = false,
             "--help" | "-h" => {
                 println!(
@@ -66,7 +90,13 @@ fn parse_args() -> Result<Args> {
                      --time <seconds>                animation time for the screenshot\n\
                      --sun <radians>                 sun elevation (0 = horizon, 1.57 = zenith)\n\
                      --yaw, --pitch <radians>        camera direction for the screenshot\n\
-                     --no-vsync                      uncap the frame rate (benchmarking)\n"
+                     --no-vsync                      uncap the frame rate (benchmarking)\n\
+                     \n\
+                     The four live dials. In a window these set where the sliders start:\n\
+                     --coverage <0..1>               how much of the sky is cloud\n\
+                     --feature-size <metres>         how big the clouds are\n\
+                     --shadow <0..2>                 self-shadowing strength\n\
+                     --exposure <0.1..4>             overall brightness\n"
                 );
                 std::process::exit(0);
             }
@@ -90,8 +120,9 @@ fn main() -> Result<()> {
                 sun_elevation: args.sun,
                 yaw: args.yaw,
                 pitch: args.pitch,
+                params: args.params,
             },
         ),
-        None => app::App::run(args.vsync),
+        None => app::App::run(args.vsync, args.params),
     }
 }

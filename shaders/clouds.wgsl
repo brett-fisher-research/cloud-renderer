@@ -42,14 +42,12 @@ const DENSITY: f32 = 1.0;           // overall multiplier on cloud thickness
 const EXTINCTION: f32 = 0.004;      // per metre: how fast cloud blocks light
 
 // --- Noise shaping ---
-// Size of the largest noise features, in metres. Smaller = busier sky.
-const NOISE_FEATURE_SIZE: f32 = 2600.0;
+// The size of the largest noise features is a live dial: `p.feature_size`.
 const FBM_OCTAVES: i32 = 5;         // layers of detail; cost scales with this
 const FBM_GAIN: f32 = 0.5;          // how much quieter each octave is
 const FBM_LACUNARITY: f32 = 2.02;   // how much finer each octave is
 
-// 0 = empty sky, 1 = solid overcast. Around 0.45 gives puffy clouds with gaps.
-const COVERAGE: f32 = 0.45;
+// How much of the sky is cloud is a live dial: `p.coverage`.
 // Where in the slab the cloud sits: fractions of the layer height.
 const CLOUD_BASE_SOFTNESS: f32 = 0.22;  // fade-in above the bottom
 const CLOUD_TOP_SOFTNESS:  f32 = 0.55;  // fade-out below the top
@@ -71,11 +69,6 @@ const WIND: vec3<f32> = vec3<f32>(-9.0, 0.0, -3.0);  // metres per second
 const LIGHT_STEPS: i32 = 6;
 const LIGHT_STEP_SIZE: f32 = 110.0;   // metres, length of the first step
 const LIGHT_STEP_GROWTH: f32 = 1.55;  // each step is longer than the last
-// Scales the self-shadowing. Below 1.0 fakes the extra brightness that real
-// clouds get from light bouncing around inside them many times, which single
-// scattering alone does not capture and which otherwise leaves them muddy.
-const SHADOW_STRENGTH: f32 = 0.60;
-
 const SUN_LIGHT: vec3<f32> = vec3<f32>(1.0, 0.93, 0.80);
 const SUN_LIGHT_INTENSITY: f32 = 3.2;
 
@@ -111,6 +104,24 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+
+// ---------------------------------------------------------------------------
+//  Live dials — must match `struct Params` in src/params.rs exactly.
+//
+//  These are the four values the on-screen panel drives. They sit in their own
+//  uniform buffer so moving a slider costs a 16-byte upload rather than a
+//  shader recompile. Everything else in the block at the top of this file is
+//  still a `const`, and still hot-reloads when you save the file.
+// ---------------------------------------------------------------------------
+
+struct Params {
+    coverage: f32,         // 0 = clear sky, 1 = solid overcast
+    feature_size: f32,     // metres: size of the largest noise features
+    shadow_strength: f32,  // scales self-shadowing; low fakes multiple scattering
+    exposure: f32,         // overall brightness, applied before tone mapping
+};
+
+@group(0) @binding(1) var<uniform> dials: Params;
 
 // Eye height above the ground, in metres.
 const CAMERA_HEIGHT: f32 = 2.0;
@@ -298,15 +309,15 @@ fn cloud_density(p: vec3<f32>) -> f32 {
     // Scroll the noise field to make the clouds drift. Moving the *sample
     // point* against the wind is the same as moving the clouds with it.
     let drift = WIND * u.time;
-    let q = (p + drift) / NOISE_FEATURE_SIZE;
+    let q = (p + drift) / dials.feature_size;
 
     let n = fbm(q);
 
     // Coverage: everything below the threshold becomes clear sky, and what
     // remains is rescaled back to [0,1] so the clouds keep their full density
     // instead of thinning out as coverage drops.
-    let threshold = 1.0 - COVERAGE;
-    let shaped = clamp((n - threshold) / max(COVERAGE, 0.001), 0.0, 1.0);
+    let threshold = 1.0 - dials.coverage;
+    let shaped = clamp((n - threshold) / max(dials.coverage, 0.001), 0.0, 1.0);
 
     return shaped * profile * DENSITY;
 }
@@ -352,7 +363,7 @@ fn light_march(p: vec3<f32>) -> f32 {
         step *= LIGHT_STEP_GROWTH;
     }
 
-    return exp(-optical_depth * EXTINCTION * SHADOW_STRENGTH);
+    return exp(-optical_depth * EXTINCTION * dials.shadow_strength);
 }
 
 // Result of marching the cloud layer: how much light got through, and how
@@ -466,8 +477,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // cloud itself scattered towards us.
     var col = sky * clouds.transmittance + clouds.scattered;
 
-    // Tone mapping: sunlit cloud and the halo both run well past 1.0, so
-    // compress the high end instead of letting it clip to flat white.
+    // Exposure, then tone mapping. Exposure scales the linear radiance like a
+    // camera's shutter speed; the tone map then compresses the high end, since
+    // sunlit cloud and the halo both run well past 1.0 and would otherwise
+    // clip to flat white. Order matters: exposing *after* the tone map would
+    // just wash out an already-compressed image.
+    col = col * dials.exposure;
     col = col / (1.0 + col);
     // The target format is sRGB, so the GPU applies the final encoding for us.
     return vec4<f32>(col, 1.0);

@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 
 use crate::camera::Uniforms;
 use crate::gpu::Gpu;
+use crate::params::Params;
 
 /// Where the shader lives, relative to the crate root.
 pub const SHADER_PATH: &str = "shaders/clouds.wgsl";
@@ -14,7 +15,9 @@ pub const SHADER_PATH: &str = "shaders/clouds.wgsl";
 pub struct Renderer {
     /// GPU-side copy of [`Uniforms`], rewritten every frame.
     uniform_buffer: wgpu::Buffer,
-    /// Binds that buffer to `@group(0) @binding(0)` in the shader.
+    /// GPU-side copy of [`Params`], rewritten only when a dial moves.
+    params_buffer: wgpu::Buffer,
+    /// Binds both buffers to `@group(0)` bindings 0 and 1 in the shader.
     bind_group: wgpu::BindGroup,
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
@@ -38,29 +41,45 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("params"),
+            size: std::mem::size_of::<Params>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // A bind group *layout* describes the shape of the shader's inputs; the
-        // bind group is the actual set of resources matching that shape.
+        // bind group is the actual set of resources matching that shape. Both
+        // uniform blocks are the same shape, so the entries only differ by
+        // binding number.
+        let uniform_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("uniform layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            entries: &[uniform_entry(0), uniform_entry(1)],
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("uniform bind group"),
             layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -82,6 +101,7 @@ impl Renderer {
 
         Ok(Self {
             uniform_buffer,
+            params_buffer,
             bind_group,
             bind_group_layout,
             pipeline_layout,
@@ -113,10 +133,17 @@ impl Renderer {
         &self.shader_path
     }
 
-    /// Upload this frame's uniforms.
+    /// Upload this frame's camera uniforms.
     pub fn update(&self, gpu: &Gpu, uniforms: &Uniforms) {
         gpu.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+    }
+
+    /// Upload the cloud dials. Cheap enough (16 bytes) to send every frame
+    /// rather than tracking whether a slider actually moved.
+    pub fn update_params(&self, gpu: &Gpu, params: &Params) {
+        gpu.queue
+            .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
     }
 
     /// Record the single full-screen draw into `encoder`.
