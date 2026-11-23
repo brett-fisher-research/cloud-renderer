@@ -21,7 +21,7 @@
 //! so the far edge of the cube matches the near edge and one cube can repeat
 //! to cover the sky.
 
-use std::time::Instant;
+use web_time::Instant;
 
 /// Scramble a lattice cell to 32 well-mixed bits.
 fn hash_u32(x: u32, y: u32, z: u32, seed: u32) -> u32 {
@@ -129,24 +129,36 @@ fn remap(v: f32, lo: f32, hi: f32, new_lo: f32, new_hi: f32) -> f32 {
 }
 
 /// Evaluate `f(x, y, z)` (in tile units) over a `w*h*d` grid on all cores.
+///
+/// A web page cannot spawn threads (not without special server headers), so
+/// there the whole grid is one chunk, filled on the calling thread.
 fn fill(w: usize, h: usize, d: usize, f: impl Fn(f32, f32, f32) -> f32 + Sync) -> Vec<f32> {
     let mut out = vec![0.0f32; w * h * d];
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let threads = if cfg!(target_arch = "wasm32") {
+        1
+    } else {
+        std::thread::available_parallelism().map_or(4, |n| n.get())
+    };
     let rows_per_chunk = (h * d).div_ceil(threads).max(1);
+    let fill_chunk = |chunk_index: usize, chunk: &mut [f32]| {
+        for (i, v) in chunk.iter_mut().enumerate() {
+            let flat = chunk_index * rows_per_chunk * w + i;
+            let (x, y, z) = (flat % w, (flat / w) % h, flat / (w * h));
+            *v = f(
+                (x as f32 + 0.5) / w as f32,
+                (y as f32 + 0.5) / h as f32,
+                (z as f32 + 0.5) / d as f32,
+            );
+        }
+    };
     std::thread::scope(|scope| {
         for (chunk_index, chunk) in out.chunks_mut(rows_per_chunk * w).enumerate() {
-            let f = &f;
-            scope.spawn(move || {
-                for (i, v) in chunk.iter_mut().enumerate() {
-                    let flat = chunk_index * rows_per_chunk * w + i;
-                    let (x, y, z) = (flat % w, (flat / w) % h, flat / (w * h));
-                    *v = f(
-                        (x as f32 + 0.5) / w as f32,
-                        (y as f32 + 0.5) / h as f32,
-                        (z as f32 + 0.5) / d as f32,
-                    );
-                }
-            });
+            let fill_chunk = &fill_chunk;
+            if threads == 1 {
+                fill_chunk(chunk_index, chunk);
+            } else {
+                scope.spawn(move || fill_chunk(chunk_index, chunk));
+            }
         }
     });
     out

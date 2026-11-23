@@ -26,7 +26,7 @@ pub struct Gpu {
 /// for this OS" and leaves out the GL fallback, which keeps the adapter list
 /// predictable.
 pub fn create_instance() -> wgpu::Instance {
-    log::info!("creating wgpu instance (native backend: Vulkan, Metal or DX12)");
+    log::info!("creating wgpu instance (Vulkan, Metal or DX12; WebGPU in a browser)");
     wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         // The display handle is only needed by the GL/WebGPU backends; the
@@ -41,13 +41,19 @@ impl Gpu {
     /// `compatible_surface` is `Some` in windowed mode so wgpu only offers us
     /// adapters that can actually present to that window, and `None` for
     /// headless screenshots where there is no surface at all.
-    pub fn new(
+    ///
+    /// Async because a browser never lets the main thread block: there the
+    /// adapter and device arrive as promises. Native callers wrap this in
+    /// `pollster::block_on`, where the futures are ready at once.
+    pub async fn new(
         instance: wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'_>>,
     ) -> Result<Self> {
         // Log everything we can see; this doubles as our "is the graphics
         // driver working?" check, standing in for `vulkaninfo`.
-        for a in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY)) {
+        // (Native only: a browser hands out one adapter and names no others.)
+        #[cfg(not(target_arch = "wasm32"))]
+        for a in instance.enumerate_adapters(wgpu::Backends::PRIMARY).await {
             let info = a.get_info();
             log::info!(
                 "available adapter: {:?} {} ({:?}, driver: {} {})",
@@ -59,13 +65,14 @@ impl Gpu {
             );
         }
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
             // Prefer a discrete GPU over an integrated one where there are both.
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface,
             ..Default::default()
-        }))
+        })
+        .await
         .context("no suitable GPU adapter found (on Linux, is mesa-vulkan-drivers installed?)")?;
 
         let info = adapter.get_info();
@@ -86,14 +93,15 @@ impl Gpu {
             log::warn!("adapter has no TIMESTAMP_QUERY; --bench will not work");
         }
 
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("cloud-renderer device"),
             required_features: features,
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
             ..Default::default()
-        }))
+        })
+        .await
         .context("failed to open a wgpu device")?;
 
         // Without this, a validation error that escapes an error scope panics

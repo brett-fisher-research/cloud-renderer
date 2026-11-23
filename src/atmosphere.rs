@@ -22,7 +22,7 @@
 //!
 //! Units in this file are kilometres.
 
-use std::time::Instant;
+use web_time::Instant;
 
 const R_GROUND: f64 = 6360.0;
 const R_TOP: f64 = 6460.0;

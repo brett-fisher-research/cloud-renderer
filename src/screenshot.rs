@@ -45,7 +45,7 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
         if opts.field { "field dump" } else { "render" }
     );
 
-    let gpu = Gpu::new(create_instance(), None)?;
+    let gpu = pollster::block_on(Gpu::new(create_instance(), None))?;
 
     // A field dump is data, not a picture: sRGB encoding on write would bend
     // every value through a gamma curve before anything could measure it.
@@ -55,9 +55,9 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
         FORMAT
     };
     let mut renderer = if opts.field {
-        Renderer::with_entry(&gpu, format, &opts.defines, "fs_field")?
+        pollster::block_on(Renderer::with_entry(&gpu, format, &opts.defines, "fs_field"))?
     } else {
-        Renderer::new(&gpu, format, &opts.defines)?
+        pollster::block_on(Renderer::new(&gpu, format, &opts.defines))?
     };
 
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {

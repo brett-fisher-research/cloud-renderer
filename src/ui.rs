@@ -76,6 +76,9 @@ impl Ui {
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         size: (u32, u32),
+        // Pixels drawn per pixel of window. 1.0 unless the surface is
+        // smaller than the window (the web build's resolution cap).
+        render_scale: f32,
         params: &mut Params,
         fps: f32,
     ) {
@@ -154,7 +157,9 @@ impl Ui {
 
         // Turn egui's shapes into triangles, then hand them to the GPU. Fonts
         // and icons arrive as texture deltas that have to be applied first.
-        let pixels_per_point = self.ctx.pixels_per_point();
+        // egui lays out in window points, so pointer positions keep matching;
+        // only the triangles are scaled to the surface actually drawn into.
+        let pixels_per_point = self.ctx.pixels_per_point() * render_scale;
         let primitives = self.ctx.tessellate(full_output.shapes, pixels_per_point);
         for (id, deltas) in &full_output.textures_delta.set {
             // One texture can arrive as several partial updates in a frame.

@@ -7,9 +7,15 @@
 //! Usage:
 //!   cargo run --release
 //!   cargo run --release -- --screenshot out.png [--time 10.0] [--sun 0.4]
+//!   trunk serve --release        (the same program in a browser tab)
+//!
+//! The web build is this same binary compiled to WebAssembly. It has the
+//! window and the dials; the command line, the headless tools and shader
+//! hot-reload need a real OS and are compiled out (`cfg(target_arch)`).
 
 mod app;
 mod atmosphere;
+#[cfg(not(target_arch = "wasm32"))]
 mod bench;
 mod camera;
 mod defines;
@@ -17,17 +23,22 @@ mod noise;
 mod gpu;
 mod params;
 mod renderer;
+#[cfg(not(target_arch = "wasm32"))]
 mod screenshot;
 mod ui;
+#[cfg(not(target_arch = "wasm32"))]
 mod watch;
 
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::{Context, Result};
 
 /// Render size when nothing else is asked for: both the window's starting
 /// size and the headless screenshot. 1920x1080 on a 2560x1440 desktop leaves
 /// room for the title bar; `--size` or `--fullscreen` go bigger.
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_SIZE: (u32, u32) = (1920, 1080);
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Args {
     screenshot: Option<String>,
     /// Dump the density field rather than the rendered sky.
@@ -57,6 +68,7 @@ struct Args {
     params: params::Params,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_args() -> Result<Args> {
     let mut args = Args {
         screenshot: None,
@@ -193,6 +205,7 @@ fn parse_args() -> Result<Args> {
 
 /// "1920x1080" -> (1920, 1080). Accepts a capital X too, since shells make it
 /// easy to type either.
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_size(v: &str) -> Result<(u32, u32)> {
     let (w, h) = v
         .to_lowercase()
@@ -206,6 +219,24 @@ fn parse_size(v: &str) -> Result<(u32, u32)> {
     Ok((w, h))
 }
 
+/// Web entry point. There is no command line, so everything starts at its
+/// default; the canvas sets the size. Logs go to the browser console, and a
+/// panic prints there with a stack trace instead of vanishing.
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    console_error_panic_hook::set_once();
+    console_log::init_with_level(log::Level::Info).expect("logger already set");
+    app::App::run(
+        true,
+        params::Params::default(),
+        (0, 0),
+        false,
+        defines::Defines::default(),
+    )
+    .expect("failed to start the event loop");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<()> {
     // Default to info-level logs; override with RUST_LOG=debug.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();

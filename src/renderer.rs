@@ -86,15 +86,19 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(gpu: &Gpu, target_format: wgpu::TextureFormat, defines: &Defines) -> Result<Self> {
-        Self::with_entry(gpu, target_format, defines, "fs_main")
+    pub async fn new(
+        gpu: &Gpu,
+        target_format: wgpu::TextureFormat,
+        defines: &Defines,
+    ) -> Result<Self> {
+        Self::with_entry(gpu, target_format, defines, "fs_main").await
     }
 
     /// As [`Renderer::new`], but drawing a different fragment entry point.
     /// `--dump-field` uses this to run `fs_field` through the same bindings
     /// and noise textures as the real renderer. Anything but `fs_main` draws
     /// straight to the target with no accumulation: a field dump is data.
-    pub fn with_entry(
+    pub async fn with_entry(
         gpu: &Gpu,
         target_format: wgpu::TextureFormat,
         defines: &Defines,
@@ -214,9 +218,7 @@ impl Renderer {
         });
 
         let shader_path = resolve_shader_path();
-        log::info!("loading shader from {}", shader_path.display());
-        let source = std::fs::read_to_string(&shader_path)
-            .with_context(|| format!("could not read {}", shader_path.display()))?;
+        let source = read_shader(&shader_path)?;
         let source = defines.apply(&source)?;
         if !defines.is_empty() {
             log::info!("shader overrides: {}", defines.summary());
@@ -225,6 +227,7 @@ impl Renderer {
         // On first load a broken shader is fatal — there is no "last good"
         // version to fall back to yet.
         let pipelines = build_pipelines(gpu, &pipeline_layout, target_format, &source, entry)
+            .await
             .map_err(|e| anyhow::anyhow!("shader failed to compile:\n{e}"))?;
 
         // A placeholder history. The first `update` replaces it with one
@@ -265,12 +268,20 @@ impl Renderer {
     ///
     /// Returns `Ok(())` if the new shader compiled. On failure the error is
     /// returned and the previously working pipelines stay in place.
+    ///
+    /// Native only: the web build has no disk to re-read.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn reload_shader(&mut self, gpu: &Gpu) -> Result<()> {
-        let source = std::fs::read_to_string(&self.shader_path)
-            .with_context(|| format!("could not read {}", self.shader_path.display()))?;
+        let source = read_shader(&self.shader_path)?;
         let source = self.defines.apply(&source)?;
 
-        match build_pipelines(gpu, &self.pipeline_layout, self.target_format, &source, self.entry) {
+        match pollster::block_on(build_pipelines(
+            gpu,
+            &self.pipeline_layout,
+            self.target_format,
+            &source,
+            self.entry,
+        )) {
             Ok(pipelines) => {
                 self.pipelines = pipelines;
                 // The old history was drawn by the old shader. Start again
@@ -283,6 +294,7 @@ impl Renderer {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn shader_path(&self) -> &Path {
         &self.shader_path
     }
@@ -514,7 +526,7 @@ fn make_history(
 
 /// Compile WGSL and build the render pipelines, capturing validation errors
 /// instead of letting them panic the process.
-fn build_pipelines(
+async fn build_pipelines(
     gpu: &Gpu,
     layout: &wgpu::PipelineLayout,
     target_format: wgpu::TextureFormat,
@@ -578,9 +590,26 @@ fn build_pipelines(
 
     // wgpu's Display already includes the full WGSL diagnostic with line
     // numbers and a caret pointing at the offending token.
-    match pollster::block_on(scope.pop()) {
+    match scope.pop().await {
         Some(err) => Err(err.to_string()),
         None => Ok(pipelines),
+    }
+}
+
+/// The shader source: read from disk natively, so it can be edited while the
+/// program runs. A web page has no disk, so there the file is compiled into
+/// the binary and `path` is unused.
+fn read_shader(path: &Path) -> Result<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        log::info!("loading shader from {}", path.display());
+        std::fs::read_to_string(path).with_context(|| format!("could not read {}", path.display()))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = path;
+        log::info!("using the shader built into the binary");
+        Ok(include_str!("../shaders/clouds.wgsl").to_string())
     }
 }
 

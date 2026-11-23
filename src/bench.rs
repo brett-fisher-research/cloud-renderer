@@ -40,7 +40,7 @@ pub struct BenchOptions {
 pub fn run(opts: &BenchOptions) -> Result<()> {
     let (width, height) = (opts.width, opts.height);
 
-    let gpu = Gpu::new(create_instance(), None)?;
+    let gpu = pollster::block_on(Gpu::new(create_instance(), None))?;
     if !gpu
         .device
         .features()
@@ -48,7 +48,7 @@ pub fn run(opts: &BenchOptions) -> Result<()> {
     {
         anyhow::bail!("this adapter has no TIMESTAMP_QUERY support, cannot benchmark");
     }
-    let mut renderer = Renderer::new(&gpu, FORMAT, &opts.defines)?;
+    let mut renderer = pollster::block_on(Renderer::new(&gpu, FORMAT, &opts.defines))?;
 
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("bench target"),

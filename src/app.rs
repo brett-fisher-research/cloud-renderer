@@ -1,8 +1,19 @@
 //! Windowed mode: winit event loop, mouse input, FPS counter, shader watching.
+//!
+//! The same code drives a desktop window and a browser canvas. Two things
+//! differ on the web, both marked with `cfg(target_arch = "wasm32")`:
+//!
+//! - Start-up is asynchronous. A browser hands out the GPU through promises
+//!   and never lets the main thread block, so the set-up runs as a spawned
+//!   future and the event loop picks the result up when it is ready.
+//! - The picture is drawn at a capped resolution and stretched to the canvas
+//!   by the browser. See [`WEB_MAX_PIXELS`].
 
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
+
+use web_time::Instant;
 
 use anyhow::{Context, Result};
 use winit::application::ApplicationHandler;
@@ -18,23 +29,142 @@ use crate::defines::Defines;
 use crate::params::Params;
 use crate::renderer::Renderer;
 use crate::ui::Ui;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::watch;
+
+/// The most pixels the web build draws per frame: 1920x1080's worth.
+///
+/// A browser tab on a high-DPI laptop screen is easily five million real
+/// pixels, well past what the frame budget was measured for. Above this the
+/// surface is made smaller than the canvas, keeping its shape, and the
+/// browser scales it up. Native windows are sized by `--size` and are not
+/// capped.
+const WEB_MAX_PIXELS: f32 = 1920.0 * 1080.0;
+
+/// The size to draw at for this window: its real pixel size, capped on web.
+fn surface_size(window: &Window) -> (u32, u32) {
+    let size = window.inner_size();
+    let (w, h) = (size.width.max(1) as f32, size.height.max(1) as f32);
+    let scale = if cfg!(target_arch = "wasm32") {
+        (WEB_MAX_PIXELS / (w * h)).sqrt().min(1.0)
+    } else {
+        1.0
+    };
+    (
+        ((w * scale).round() as u32).max(1),
+        ((h * scale).round() as u32).max(1),
+    )
+}
 
 /// Everything that only exists once a window has been created.
 struct Active {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    /// The format the passes draw into: the surface's, sRGB-encoded.
+    target_format: wgpu::TextureFormat,
     gpu: Gpu,
     renderer: Renderer,
     /// The dial panel drawn over the clouds.
     ui: Ui,
     /// Shader-file-changed notifications from the watcher thread.
+    #[cfg(not(target_arch = "wasm32"))]
     shader_changes: Receiver<()>,
+}
+
+impl Active {
+    /// Open the GPU on `window` and build the renderer: the slow part of
+    /// start-up, mostly baking noise.
+    async fn new(window: Arc<Window>, vsync: bool, defines: Defines) -> Result<Self> {
+        let instance = create_instance();
+        // The surface borrows the window; cloning the Arc gives it 'static.
+        let surface = instance
+            .create_surface(window.clone())
+            .context("failed to create surface")?;
+        let gpu = Gpu::new(instance, Some(&surface)).await?;
+
+        let (width, height) = surface_size(&window);
+        let mut config = surface
+            .get_default_config(&gpu.adapter, width, height)
+            .context("surface is not supported by this adapter")?;
+        // Fifo = vsync, which is what we want for a smooth look-around.
+        // Immediate uncaps the frame rate so we can see real GPU cost. A
+        // browser only ever presents in step with the display.
+        config.present_mode = if vsync || cfg!(target_arch = "wasm32") {
+            wgpu::PresentMode::Fifo
+        } else {
+            wgpu::PresentMode::Immediate
+        };
+        // The shader writes linear light and relies on an sRGB target to
+        // encode it. Desktop surfaces offer an sRGB format directly. A
+        // browser canvas does not, but lets us *view* its plain format as
+        // sRGB, which does the same encoding on write.
+        let target_format = config.format.add_srgb_suffix();
+        if target_format != config.format {
+            config.view_formats.push(target_format);
+        }
+        surface.configure(&gpu.device, &config);
+        log::info!(
+            "surface configured: {}x{} format {:?} (drawn as {:?}) present {:?}",
+            config.width,
+            config.height,
+            config.format,
+            target_format,
+            config.present_mode
+        );
+
+        let renderer = Renderer::new(&gpu, target_format, &defines).await?;
+        let ui = Ui::new(&gpu, &window, target_format);
+        #[cfg(not(target_arch = "wasm32"))]
+        let shader_changes = watch::watch_file(renderer.shader_path());
+
+        Ok(Self {
+            window,
+            surface,
+            config,
+            target_format,
+            gpu,
+            renderer,
+            ui,
+            #[cfg(not(target_arch = "wasm32"))]
+            shader_changes,
+        })
+    }
+
+    /// Match the surface to the window after a resize.
+    fn resize(&mut self) {
+        let (width, height) = surface_size(&self.window);
+        if (width, height) == (self.config.width, self.config.height) {
+            return;
+        }
+        self.config.width = width;
+        self.config.height = height;
+        self.surface.configure(&self.gpu.device, &self.config);
+        log::info!("resized to {width}x{height}");
+    }
+}
+
+/// Replace the page's "loading" line with `message`, or remove it.
+#[cfg(target_arch = "wasm32")]
+fn set_loading(message: Option<&str>) {
+    let element = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("loading"));
+    if let Some(element) = element {
+        match message {
+            Some(text) => element.set_text_content(Some(text)),
+            None => element.remove(),
+        }
+    }
 }
 
 pub struct App {
     active: Option<Active>,
+    /// True once start-up has begun, so a second `resumed` does not repeat it.
+    starting: bool,
+    /// Where the web build's asynchronous start-up leaves its result.
+    #[cfg(target_arch = "wasm32")]
+    pending: std::rc::Rc<std::cell::RefCell<Option<Result<Active>>>>,
     /// false = present as fast as the GPU can, for benchmarking.
     vsync: bool,
     camera: Camera,
@@ -42,8 +172,11 @@ pub struct App {
     params: Params,
     /// Starting window size in real pixels. Resizing the window afterwards
     /// just reconfigures the surface, so this is only where it begins.
+    /// Unused on web, where the page's CSS sizes the canvas.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     size: (u32, u32),
     /// Skip the window size and fill the monitor instead.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fullscreen: bool,
     /// `--def` shader constant overrides for this run.
     defines: Defines,
@@ -66,6 +199,9 @@ impl App {
     pub fn new() -> Self {
         Self {
             active: None,
+            starting: false,
+            #[cfg(target_arch = "wasm32")]
+            pending: Default::default(),
             vsync: true,
             camera: Camera::default(),
             params: Params::default(),
@@ -100,8 +236,44 @@ impl App {
         app.size = size;
         app.fullscreen = fullscreen;
         app.defines = defines;
+        #[cfg(not(target_arch = "wasm32"))]
         event_loop.run_app(&mut app).context("event loop failed")?;
+        // On web the loop cannot own the thread. `spawn_app` hooks it into
+        // the browser's own event loop and returns at once.
+        #[cfg(target_arch = "wasm32")]
+        {
+            use winit::platform::web::EventLoopExtWebSys;
+            event_loop.spawn_app(app);
+        }
         Ok(())
+    }
+
+    /// Take the finished start-up and begin rendering, or report why not.
+    fn install(&mut self, result: Result<Active>) {
+        match result {
+            Ok(active) => {
+                log::info!(
+                    "controls: drag = look around, shift-drag = sun compass, \
+                     scroll = sun elevation, Esc = quit"
+                );
+                #[cfg(target_arch = "wasm32")]
+                set_loading(None);
+                self.active = Some(active);
+                self.start = Instant::now();
+            }
+            Err(e) => {
+                log::error!("start-up failed: {e:#}");
+                // A page should say what is wrong rather than stay blank.
+                // The usual cause is a browser without WebGPU.
+                #[cfg(target_arch = "wasm32")]
+                set_loading(Some(&format!(
+                    "Could not start: {e:#}. This needs a browser with WebGPU \
+                     (recent Chrome, Edge or Safari)."
+                )));
+                #[cfg(not(target_arch = "wasm32"))]
+                panic!("start-up failed: {e:#}");
+            }
+        }
     }
 
     fn render(&mut self) {
@@ -129,9 +301,10 @@ impl App {
             }
         };
 
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(active.target_format),
+            ..Default::default()
+        });
 
         let t = self.start.elapsed().as_secs_f32();
         let uniforms = self
@@ -156,6 +329,7 @@ impl App {
             &mut encoder,
             &view,
             (active.config.width, active.config.height),
+            active.config.width as f32 / active.window.inner_size().width.max(1) as f32,
             &mut self.params,
             self.fps,
         );
@@ -193,6 +367,7 @@ impl App {
 
     /// If the shader file changed, try to rebuild. Failures are logged and the
     /// previous pipeline keeps rendering.
+    #[cfg(not(target_arch = "wasm32"))]
     fn poll_shader_changes(&mut self) {
         let Some(active) = self.active.as_mut() else {
             return;
@@ -216,73 +391,62 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.active.is_some() {
+        if self.starting {
             return;
         }
+        self.starting = true;
 
-        // PhysicalSize, not LogicalSize: --size should mean the pixel count the
-        // fragment shader actually has to fill, not a DPI-scaled number.
-        let mut attrs = Window::default_attributes()
-            .with_title("cloud-renderer — starting...")
-            .with_inner_size(winit::dpi::PhysicalSize::new(self.size.0, self.size.1));
-        if self.fullscreen {
-            // Borderless(None) = the monitor the window lands on, at its
-            // current mode, so there is no mode switch to wait for.
-            attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
-        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let attrs = {
+            // PhysicalSize, not LogicalSize: --size should mean the pixel count
+            // the fragment shader actually has to fill, not a DPI-scaled number.
+            let attrs = Window::default_attributes()
+                .with_title("cloud-renderer — starting...")
+                .with_inner_size(winit::dpi::PhysicalSize::new(self.size.0, self.size.1));
+            if self.fullscreen {
+                // Borderless(None) = the monitor the window lands on, at its
+                // current mode, so there is no mode switch to wait for.
+                attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)))
+            } else {
+                attrs
+            }
+        };
+        // On web the "window" is the <canvas id="canvas"> already on the
+        // page, and the page's CSS decides how big it is.
+        #[cfg(target_arch = "wasm32")]
+        let attrs = {
+            use wasm_bindgen::JsCast;
+            use winit::platform::web::WindowAttributesExtWebSys;
+            let canvas = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.get_element_by_id("canvas"))
+                .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok());
+            if canvas.is_none() {
+                log::error!("no <canvas id=\"canvas\"> on the page");
+            }
+            Window::default_attributes()
+                .with_title("cloud-renderer")
+                .with_canvas(canvas)
+        };
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
                 .expect("failed to create window"),
         );
 
-        let instance = create_instance();
-        // The surface borrows the window; cloning the Arc gives it 'static.
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("failed to create surface");
-        let gpu = Gpu::new(instance, Some(&surface)).expect("failed to initialise GPU");
-
-        let size = window.inner_size();
-        let mut config = surface
-            .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
-            .expect("surface is not supported by this adapter");
-        // Fifo = vsync, which is what we want for a smooth look-around.
-        // Immediate uncaps the frame rate so we can see real GPU cost.
-        config.present_mode = if self.vsync {
-            wgpu::PresentMode::Fifo
-        } else {
-            wgpu::PresentMode::Immediate
-        };
-        surface.configure(&gpu.device, &config);
-        log::info!(
-            "surface configured: {}x{} format {:?} present {:?}",
-            config.width,
-            config.height,
-            config.format,
-            config.present_mode
-        );
-
-        let renderer = Renderer::new(&gpu, config.format, &self.defines)
-            .expect("failed to build renderer");
-        let ui = Ui::new(&gpu, &window, config.format);
-        let shader_changes = watch::watch_file(renderer.shader_path());
-
-        log::info!(
-            "controls: drag = look around, shift-drag = sun compass, \
-             scroll = sun elevation, Esc = quit"
-        );
-
-        self.active = Some(Active {
-            window,
-            surface,
-            config,
-            gpu,
-            renderer,
-            ui,
-            shader_changes,
-        });
-        self.start = Instant::now();
+        let init = Active::new(window, self.vsync, self.defines.clone());
+        // Natively the GPU answers at once, so wait here. In a browser, run
+        // it as a task; `about_to_wait` collects the result.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.install(pollster::block_on(init));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let pending = self.pending.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = init.await;
+                *pending.borrow_mut() = Some(result);
+            });
+        }
     }
 
     fn window_event(
@@ -311,19 +475,18 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 // Esc quits even while typing in the panel; there is nothing
                 // in there to type into.
+                // (Not on web: a page has nothing to quit to.)
                 if event.state == ElementState::Pressed
                     && event.logical_key == Key::Named(NamedKey::Escape)
+                    && cfg!(not(target_arch = "wasm32"))
                 {
                     event_loop.exit();
                 }
             }
 
-            WindowEvent::Resized(size) => {
+            WindowEvent::Resized(_) => {
                 if let Some(active) = self.active.as_mut() {
-                    active.config.width = size.width.max(1);
-                    active.config.height = size.height.max(1);
-                    active.surface.configure(&active.gpu.device, &active.config);
-                    log::info!("resized to {}x{}", active.config.width, active.config.height);
+                    active.resize();
                 }
             }
 
@@ -385,7 +548,15 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        #[cfg(not(target_arch = "wasm32"))]
         self.poll_shader_changes();
+        #[cfg(target_arch = "wasm32")]
+        {
+            let finished = self.pending.borrow_mut().take();
+            if let Some(result) = finished {
+                self.install(result);
+            }
+        }
         // Drive the next frame; ControlFlow::Poll means this runs continuously.
         if let Some(active) = &self.active {
             active.window.request_redraw();
