@@ -15,7 +15,7 @@ use egui_wgpu::ScreenDescriptor;
 use winit::window::Window;
 
 use crate::gpu::Gpu;
-use crate::params::{Algorithm, Params};
+use crate::params::Params;
 
 pub struct Ui {
     ctx: egui::Context,
@@ -89,34 +89,6 @@ impl Ui {
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.label(format!("{fps:.0} fps"));
-                    ui.separator();
-
-                    // The algorithm picker. This is a different kind of knob
-                    // from the sliders under it: those move a number the
-                    // shader reads, this changes which density field it
-                    // builds at all. Both arrive the same way, as a value in
-                    // the params uniform, so switching costs one 32-byte
-                    // upload and no recompile.
-                    let mut algorithm = params.algorithm();
-                    egui::ComboBox::from_label("algorithm")
-                        .selected_text(algorithm.name())
-                        .show_ui(ui, |ui| {
-                            for option in Algorithm::ALL {
-                                ui.selectable_value(&mut algorithm, option, option.name())
-                                    .on_hover_text(option.help());
-                            }
-                        })
-                        .response
-                        .on_hover_text(algorithm.help());
-                    if algorithm != params.algorithm() {
-                        params.algorithm = algorithm as u32;
-                        log::info!("algorithm: {}", algorithm.name());
-                    }
-                    ui.label(
-                        egui::RichText::new(algorithm.help())
-                            .small()
-                            .weak(),
-                    );
                     ui.separator();
 
                     ui.add(

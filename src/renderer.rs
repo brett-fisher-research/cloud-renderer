@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 
 use crate::camera::Uniforms;
 use crate::defines::Defines;
+use crate::atmosphere;
 use crate::noise;
 use crate::gpu::Gpu;
 use crate::params::Params;
@@ -29,7 +30,7 @@ pub struct Renderer {
     /// Tiling 3D noise, baked once at startup. Keeps the textures alive for
     /// as long as the bind group that references them.
     #[allow(dead_code)]
-    noise_textures: (wgpu::Texture, wgpu::Texture, wgpu::Texture),
+    textures: [wgpu::Texture; 5],
     /// Format of whatever we draw into (swapchain texture, or offscreen RGBA).
     target_format: wgpu::TextureFormat,
     shader_path: PathBuf,
@@ -89,35 +90,22 @@ impl Renderer {
             },
             count: None,
         };
-        // Bake the noise field into two tiling 3D textures: a big one for the
-        // overall cloud shape and a small one for edge detail. A filtered
-        // texture fetch replaces dozens of hash-and-interpolate instructions,
-        // and the GPU's texture units do the trilinear blend in fixed-function
-        // hardware, in parallel with the shader's arithmetic.
-        // The base tile is four times the feature size, so the loudest octave
-        // is the third. See `bake_fbm` for why the stack peaks there instead
-        // of falling off from the start.
-        let noise_base = noise::bake_fbm(
-            device,
-            &gpu.queue,
-            "noise base",
-            256,
-            &[0.25, 0.4, 0.5, 0.25, 0.125, 0.0625, 0.03125],
-        );
-        let noise_detail =
-            noise::bake_fbm(device, &gpu.queue, "noise detail", 64, &[0.5, 0.25, 0.125, 0.0625]);
-        // Cellular noise, for the `billow` and `puffs` algorithms. Half the
-        // resolution of the base field: it is all rounded bumps with no fine
-        // detail in it, so there is nothing for the extra voxels to carry.
-        // Four cells across the tile matches the base field's loudest octave,
-        // so a bump is about the size of a cloud.
-        let noise_worley =
-            noise::bake_worley(device, &gpu.queue, "noise worley", 128, 4, &[0.625, 0.25, 0.125]);
-        let base_view = noise_base.create_view(&wgpu::TextureViewDescriptor::default());
-        let detail_view = noise_detail.create_view(&wgpu::TextureViewDescriptor::default());
-        let worley_view = noise_worley.create_view(&wgpu::TextureViewDescriptor::default());
+        // Bake everything the shader samples. See `noise.rs` and
+        // `atmosphere.rs` for what each texture holds and why.
+        let noise_shape = noise::bake_shape(device, &gpu.queue, 128);
+        let noise_detail = noise::bake_detail(device, &gpu.queue, 64);
+        let weather = noise::bake_weather(device, &gpu.queue, 512);
+        let (transmittance, multiscatter) = atmosphere::bake(device, &gpu.queue);
+        let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+        let views = [
+            view(&noise_shape),
+            view(&noise_detail),
+            view(&weather),
+            view(&transmittance),
+            view(&multiscatter),
+        ];
 
-        // Repeat addressing is what makes one 128-voxel cube cover the whole
+        // Repeat addressing is what makes one cube of noise cover the whole
         // sky: sample coordinates outside 0..1 wrap back around.
         let noise_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("noise sampler"),
@@ -129,64 +117,74 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
+        // The atmosphere tables are functions, not patterns: reading past
+        // the edge must clamp to the last value, not wrap to the other side.
+        let table_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("table sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
-        let texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        // The vertex stage reads the tables too: it works out the handful of
+        // per-frame colours (ambient sky light, exposure) once per vertex
+        // instead of once per pixel.
+        let both = wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX;
+        let texture_entry =
+            |binding: u32, view_dimension: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: both,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension,
+                    multisampled: false,
+                },
+                count: None,
+            };
+        let sampler_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D3,
-                multisampled: false,
-            },
+            visibility: both,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
         };
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("uniform layout"),
+            label: Some("cloud layout"),
             entries: &[
                 uniform_entry(0),
                 uniform_entry(1),
-                texture_entry(2),
-                texture_entry(3),
-                texture_entry(5),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
+                texture_entry(2, wgpu::TextureViewDimension::D3),
+                texture_entry(3, wgpu::TextureViewDimension::D3),
+                texture_entry(4, wgpu::TextureViewDimension::D2),
+                texture_entry(5, wgpu::TextureViewDimension::D2),
+                texture_entry(6, wgpu::TextureViewDimension::D2),
+                sampler_entry(7),
+                sampler_entry(8),
             ],
         });
 
+        let mut entries = vec![
+            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
+        ];
+        for (i, v) in views.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 2 + i as u32,
+                resource: wgpu::BindingResource::TextureView(v),
+            });
+        }
+        entries.push(wgpu::BindGroupEntry {
+            binding: 7,
+            resource: wgpu::BindingResource::Sampler(&noise_sampler),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 8,
+            resource: wgpu::BindingResource::Sampler(&table_sampler),
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("uniform bind group"),
+            label: Some("cloud bind group"),
             layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&base_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&detail_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&noise_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::TextureView(&worley_view),
-                },
-            ],
+            entries: &entries,
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -217,7 +215,7 @@ impl Renderer {
             bind_group_layout,
             pipeline_layout,
             pipeline,
-            noise_textures: (noise_base, noise_detail, noise_worley),
+            textures: [noise_shape, noise_detail, weather, transmittance, multiscatter],
             target_format,
             shader_path,
             defines: defines.clone(),

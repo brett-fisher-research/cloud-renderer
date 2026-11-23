@@ -1,0 +1,95 @@
+#!/usr/bin/env -S uv run --script
+# usage: tools/shots <name> [--size WxH] [--only view,view] [extra renderer flags...]
+# desc: Render the standard set of views to out/<name>/ and tile them into out/<name>.png
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pillow"]
+# ///
+"""A contact sheet of the views that matter, for judging a change by eye.
+
+One view flatters any renderer. This set is chosen so each one stresses
+something different: front-lit, side-lit and back-lit cloud, a low sun, an
+overcast sky, a nearly clear one, straight up, and the horizon.
+
+  tools/shots before
+  tools/shots after --def EXTINCTION=0.03
+  tools/shots dusk --only sunset,dusk --size 1920x1080
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+from PIL import Image, ImageDraw
+
+ROOT = Path(__file__).resolve().parent.parent
+BIN = ROOT / "target" / "release" / "cloud-renderer"
+
+# The default sun sits at azimuth 0.6, elevation 0.30.
+VIEWS = [
+    ("default",   []),
+    ("side-lit",  ["--yaw", "2.2", "--pitch", "0.25"]),
+    ("front-lit", ["--yaw", "3.74", "--pitch", "0.25"]),
+    ("into-sun",  ["--yaw", "0.85", "--pitch", "0.30", "--coverage", "0.3"]),
+    ("noon",      ["--sun", "1.1", "--yaw", "2.0", "--pitch", "0.35"]),
+    ("sunset",    ["--sun", "0.04", "--yaw", "0.75", "--pitch", "0.18"]),
+    ("dusk",      ["--sun", "-0.05", "--yaw", "0.6", "--pitch", "0.2"]),
+    ("overcast",  ["--coverage", "0.85", "--pitch", "0.55"]),
+    ("sparse",    ["--coverage", "0.15", "--yaw", "2.6", "--pitch", "0.25"]),
+    ("up",        ["--pitch", "1.2", "--yaw", "2.0"]),
+    ("horizon",   ["--coverage", "0.6", "--pitch", "0.03", "--yaw", "1.6"]),
+    ("small",     ["--feature-size", "1200", "--yaw", "2.2", "--pitch", "0.3"]),
+]
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if not args or args[0].startswith("-"):
+        raise SystemExit(__doc__)
+    name, rest = args[0], args[1:]
+    size, only = "960x540", None
+    extra: list[str] = []
+    while rest:
+        a = rest.pop(0)
+        if a == "--size":
+            size = rest.pop(0)
+        elif a == "--only":
+            only = rest.pop(0).split(",")
+        else:
+            extra.append(a)
+
+    subprocess.run(["cargo", "build", "--release", "--quiet"], cwd=ROOT, check=True)
+    out = ROOT / "out" / name
+    out.mkdir(parents=True, exist_ok=True)
+
+    views = [v for v in VIEWS if only is None or v[0] in only]
+    tiles = []
+    for view, flags in views:
+        path = out / f"{view}.png"
+        p = subprocess.run(
+            [str(BIN), "--screenshot", str(path), "--size", size, *flags, *extra],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        if p.returncode != 0:
+            raise SystemExit(f"{view} failed:\n{p.stderr[-3000:]}")
+        tiles.append((view, Image.open(path).convert("RGB")))
+
+    # Tile at a size that keeps the whole sheet readable in one image.
+    columns = min(3, len(tiles))
+    tw = 640
+    th = tw * tiles[0][1].height // tiles[0][1].width
+    rows = -(-len(tiles) // columns)
+    sheet = Image.new("RGB", (columns * tw, rows * th))
+    draw = ImageDraw.Draw(sheet)
+    for i, (view, im) in enumerate(tiles):
+        x, y = (i % columns) * tw, (i // columns) * th
+        sheet.paste(im.resize((tw, th), Image.LANCZOS), (x, y))
+        draw.text((x + 7, y + 5), view, fill=(0, 0, 0))
+        draw.text((x + 6, y + 4), view, fill=(255, 255, 255))
+    sheet_path = ROOT / "out" / f"{name}.png"
+    sheet.save(sheet_path)
+    print(sheet_path)
+
+
+if __name__ == "__main__":
+    main()
