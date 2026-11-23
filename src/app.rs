@@ -14,6 +14,7 @@ use winit::window::{Window, WindowId};
 
 use crate::camera::Camera;
 use crate::gpu::{Gpu, create_instance};
+use crate::defines::Defines;
 use crate::params::Params;
 use crate::renderer::Renderer;
 use crate::ui::Ui;
@@ -44,6 +45,8 @@ pub struct App {
     size: (u32, u32),
     /// Skip the window size and fill the monitor instead.
     fullscreen: bool,
+    /// `--def` shader constant overrides for this run.
+    defines: Defines,
     start: Instant,
 
     // Input state.
@@ -68,6 +71,7 @@ impl App {
             params: Params::default(),
             size: (1280, 720),
             fullscreen: false,
+            defines: Defines::default(),
             start: Instant::now(),
             dragging: false,
             last_cursor: None,
@@ -79,7 +83,13 @@ impl App {
         }
     }
 
-    pub fn run(vsync: bool, params: Params, size: (u32, u32), fullscreen: bool) -> Result<()> {
+    pub fn run(
+        vsync: bool,
+        params: Params,
+        size: (u32, u32),
+        fullscreen: bool,
+        defines: Defines,
+    ) -> Result<()> {
         let event_loop = EventLoop::new().context("failed to create event loop")?;
         // Poll (rather than Wait) so we render continuously — the clouds drift
         // even when there is no input.
@@ -89,6 +99,7 @@ impl App {
         app.params = params;
         app.size = size;
         app.fullscreen = fullscreen;
+        app.defines = defines;
         event_loop.run_app(&mut app).context("event loop failed")?;
         Ok(())
     }
@@ -252,7 +263,8 @@ impl ApplicationHandler for App {
             config.present_mode
         );
 
-        let renderer = Renderer::new(&gpu, config.format).expect("failed to build renderer");
+        let renderer = Renderer::new(&gpu, config.format, &self.defines)
+            .expect("failed to build renderer");
         let ui = Ui::new(&gpu, &window, config.format);
         let shader_changes = watch::watch_file(renderer.shader_path());
 

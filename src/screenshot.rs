@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 
 use crate::camera::Camera;
+use crate::defines::Defines;
 use crate::gpu::{create_instance, Gpu};
 use crate::params::Params;
 use crate::renderer::Renderer;
@@ -20,7 +21,9 @@ pub struct ShotOptions {
     pub sun_elevation: Option<f32>,
     pub yaw: Option<f32>,
     pub pitch: Option<f32>,
-    pub params: Params,
+    pub params: Params,    /// `--def` shader constant overrides for this run.
+    pub defines: Defines,
+
 }
 
 pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
@@ -28,7 +31,7 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
     log::info!("headless render {width}x{height} -> {path}");
 
     let gpu = Gpu::new(create_instance(), None)?;
-    let renderer = Renderer::new(&gpu, FORMAT)?;
+    let renderer = Renderer::new(&gpu, FORMAT, &opts.defines)?;
 
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("screenshot target"),

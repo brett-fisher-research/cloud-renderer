@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::camera::Uniforms;
+use crate::defines::Defines;
 use crate::noise;
 use crate::gpu::Gpu;
 use crate::params::Params;
@@ -32,10 +33,17 @@ pub struct Renderer {
     /// Format of whatever we draw into (swapchain texture, or offscreen RGBA).
     target_format: wgpu::TextureFormat,
     shader_path: PathBuf,
+    /// `--def` overrides, re-applied on every hot-reload so a sweep's
+    /// constants survive editing the file while it runs.
+    defines: Defines,
 }
 
 impl Renderer {
-    pub fn new(gpu: &Gpu, target_format: wgpu::TextureFormat) -> Result<Self> {
+    pub fn new(
+        gpu: &Gpu,
+        target_format: wgpu::TextureFormat,
+        defines: &Defines,
+    ) -> Result<Self> {
         let device = &gpu.device;
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -165,6 +173,10 @@ impl Renderer {
         log::info!("loading shader from {}", shader_path.display());
         let source = std::fs::read_to_string(&shader_path)
             .with_context(|| format!("could not read {}", shader_path.display()))?;
+        let source = defines.apply(&source)?;
+        if !defines.is_empty() {
+            log::info!("shader overrides: {}", defines.summary());
+        }
 
         // On first load a broken shader is fatal — there is no "last good"
         // version to fall back to yet.
@@ -181,6 +193,7 @@ impl Renderer {
             noise_textures: (noise_base, noise_detail),
             target_format,
             shader_path,
+            defines: defines.clone(),
         })
     }
 
@@ -191,6 +204,7 @@ impl Renderer {
     pub fn reload_shader(&mut self, gpu: &Gpu) -> Result<()> {
         let source = std::fs::read_to_string(&self.shader_path)
             .with_context(|| format!("could not read {}", self.shader_path.display()))?;
+        let source = self.defines.apply(&source)?;
 
         match build_pipeline(gpu, &self.pipeline_layout, self.target_format, &source) {
             Ok(pipeline) => {

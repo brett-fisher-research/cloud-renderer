@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 
 use crate::camera::Camera;
+use crate::defines::Defines;
 use crate::gpu::{create_instance, Gpu};
 use crate::params::Params;
 use crate::renderer::Renderer;
@@ -31,7 +32,9 @@ pub struct BenchOptions {
     pub pitch: Option<f32>,
     pub params: Params,
     /// Printed alongside the result so a sweep's output is self-describing.
-    pub label: String,
+    pub label: String,    /// `--def` shader constant overrides for this run.
+    pub defines: Defines,
+
 }
 
 pub fn run(opts: &BenchOptions) -> Result<()> {
@@ -45,7 +48,7 @@ pub fn run(opts: &BenchOptions) -> Result<()> {
     {
         anyhow::bail!("this adapter has no TIMESTAMP_QUERY support, cannot benchmark");
     }
-    let renderer = Renderer::new(&gpu, FORMAT)?;
+    let renderer = Renderer::new(&gpu, FORMAT, &opts.defines)?;
 
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("bench target"),
@@ -126,8 +129,13 @@ pub fn run(opts: &BenchOptions) -> Result<()> {
     println!(
         "{label:<28} {w}x{h}  cov {cov:.2}  feat {feat:<5.0}  \
          gpu median {median:6.2} ms ({fps:5.1} fps)  min {min:6.2}  p95 {p95:6.2}  \
-         mean {mean:6.2}  wall {wall:.2}s",
+         mean {mean:6.2}  wall {wall:.2}s{defs}",
         label = opts.label,
+        defs = if opts.defines.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", opts.defines.summary())
+        },
         w = width,
         h = height,
         cov = opts.params.coverage,

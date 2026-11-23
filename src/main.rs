@@ -11,6 +11,7 @@
 mod app;
 mod bench;
 mod camera;
+mod defines;
 mod noise;
 mod gpu;
 mod params;
@@ -42,6 +43,8 @@ struct Args {
     yaw: Option<f32>,
     pitch: Option<f32>,
     vsync: bool,
+    /// `--def NAME=VALUE` overrides applied to the shader before it compiles.
+    defines: defines::Defines,
     /// Starting values for the four live dials. In windowed mode these are just
     /// where the sliders begin; headlessly they are the whole story.
     params: params::Params,
@@ -60,6 +63,7 @@ fn parse_args() -> Result<Args> {
         yaw: None,
         pitch: None,
         vsync: true,
+        defines: defines::Defines::default(),
         params: params::Params::default(),
     };
     let mut it = std::env::args().skip(1);
@@ -116,6 +120,10 @@ fn parse_args() -> Result<Args> {
                 let v = it.next().context("--exposure needs a number (0.1..4)")?;
                 args.params.exposure = v.parse().with_context(|| format!("bad --exposure: {v}"))?;
             }
+            "--def" => {
+                let v = it.next().context("--def needs NAME=VALUE")?;
+                args.defines.push_arg(&v)?;
+            }
             "--no-vsync" => args.vsync = false,
             "--help" | "-h" => {
                 println!(
@@ -131,6 +139,8 @@ fn parse_args() -> Result<Args> {
                      --bench                         headless GPU-timed benchmark, no window\n\
                      --bench-frames <n>              frames to time (default 48)\n\
                      --label <text>                  tag printed with the benchmark line\n\
+                     --def NAME=VALUE                override a `const` in the shader\n\
+                                                     (repeatable; the file on disk is untouched)\n\
                      \n\
                      The four live dials. In a window these set where the sliders start:\n\
                      --coverage <0..1>               how much of the sky is cloud\n\
@@ -178,6 +188,7 @@ fn main() -> Result<()> {
             pitch: args.pitch,
             params: args.params,
             label: args.label,
+            defines: args.defines,
         });
     }
 
@@ -192,8 +203,15 @@ fn main() -> Result<()> {
                 yaw: args.yaw,
                 pitch: args.pitch,
                 params: args.params,
+                defines: args.defines,
             },
         ),
-        None => app::App::run(args.vsync, args.params, args.size, args.fullscreen),
+        None => app::App::run(
+            args.vsync,
+            args.params,
+            args.size,
+            args.fullscreen,
+            args.defines,
+        ),
     }
 }
