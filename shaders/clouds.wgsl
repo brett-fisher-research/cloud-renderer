@@ -45,7 +45,8 @@ const EXTINCTION: f32 = 0.004;      // per metre: how fast cloud blocks light
 // The size of the largest noise features is a live dial: `p.feature_size`.
 const FBM_OCTAVES: i32 = 5;         // layers of detail; cost scales with this
 const FBM_GAIN: f32 = 0.5;          // how much quieter each octave is
-const FBM_LACUNARITY: f32 = 2.02;   // how much finer each octave is
+const FBM_LACUNARITY: f32 = 2.02;
+const TILE_SCALE: f32 = 4.0;   // how much finer each octave is
 
 // How much of the sky is cloud is a live dial: `p.coverage`.
 // Where in the slab the cloud sits: fractions of the layer height.
@@ -219,6 +220,38 @@ fn slab_intersect(origin: vec3<f32>, dir: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(t_enter, t_exit);
 }
 
+
+// ---------------------------------------------------------------------------
+//  Baked noise: octaves of the field precomputed into tiling 3D textures.
+//  One filtered fetch in fixed-function hardware replaces several octaves of
+//  hash-and-interpolate arithmetic.
+// ---------------------------------------------------------------------------
+@group(0) @binding(2) var noise_base: texture_3d<f32>;
+@group(0) @binding(3) var noise_detail: texture_3d<f32>;
+@group(0) @binding(4) var noise_sampler: sampler;
+
+// The detail texture stands in for octaves 3-5, so its tile is a quarter of
+// the feature size: the frequency octave 3 had.
+const DETAIL_SCALE: f32 = 4.0;
+const COARSE_WEIGHT: f32 = 0.75;    // summed amplitudes of octaves 1-2
+const DETAIL_WEIGHT: f32 = 0.21875; // summed amplitudes of octaves 3-5
+
+// Used only by the all-baked variants.
+const BASE_DETAIL_SCALE: f32 = 7.0;
+const DETAIL_STRENGTH: f32 = 0.35;
+
+fn baked_noise(q: vec3<f32>, detail: bool) -> f32 {
+    // textureSampleLevel, not textureSample: the raymarch loop has breaks in
+    // it, so it is not uniform control flow, and implicit-derivative sampling
+    // is illegal there. There are no mips anyway, so level 0 is all there is.
+    var n = textureSampleLevel(noise_base, noise_sampler, q, 0.0).r;
+    if (detail) {
+        let d = textureSampleLevel(noise_detail, noise_sampler, q * BASE_DETAIL_SCALE, 0.0).r;
+        n = n - (1.0 - n) * d * DETAIL_STRENGTH;
+    }
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 //  Noise
 //
@@ -309,9 +342,9 @@ fn cloud_density(p: vec3<f32>) -> f32 {
     // Scroll the noise field to make the clouds drift. Moving the *sample
     // point* against the wind is the same as moving the clouds with it.
     let drift = WIND * u.time;
-    let q = (p + drift) / dials.feature_size;
+    let q = (p + drift) / (dials.feature_size * TILE_SCALE);
 
-    let n = fbm(q);
+    let n = textureSampleLevel(noise_base, noise_sampler, q, 0.0).r;
 
     // Coverage: everything below the threshold becomes clear sky, and what
     // remains is rescaled back to [0,1] so the clouds keep their full density

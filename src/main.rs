@@ -11,6 +11,7 @@
 mod app;
 mod bench;
 mod camera;
+mod noise;
 mod gpu;
 mod params;
 mod renderer;
