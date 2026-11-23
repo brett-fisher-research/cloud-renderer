@@ -14,8 +14,9 @@ lives in one shader you can edit while the program runs.
 
 ### CPU side (Rust)
 
-Opens a window, bakes five textures once at startup, draws one full-screen triangle, and writes
-two small uniform buffers each frame. It does no geometry, no scene graph and no per-pixel work.
+Opens a window, bakes five textures once at startup, and each frame writes two small uniform
+buffers and draws one full-screen triangle twice: once for the clouds, once to present them. It
+does no geometry, no scene graph and no per-pixel work.
 
 - `src/main.rs` — argument parsing, picks windowed or headless mode.
 - `src/gpu.rs` — wgpu instance, adapter, device and queue. Vulkan-only; logs every adapter it sees.
@@ -24,7 +25,8 @@ two small uniform buffers each frame. It does no geometry, no scene graph and no
 - `src/camera.rs` — look-around camera and the `Uniforms` struct sent to the GPU.
 - `src/params.rs` — the four live dials and their slider ranges.
 - `src/ui.rs` — the egui panel the dials are drawn on.
-- `src/renderer.rs` — pipeline, bindings, and shader compilation with hot-reload.
+- `src/renderer.rs` — pipelines, bindings, the history textures and per-frame temporal state,
+  and shader compilation with hot-reload.
 - `src/app.rs` — winit event loop, mouse input, FPS counter.
 - `src/screenshot.rs`, `src/bench.rs` — headless still and headless GPU-timed benchmark.
 - `src/defines.rs`, `src/watch.rs` — `--def` constant overrides and shader file watching.
@@ -44,7 +46,10 @@ Per pixel, the fragment shader:
    point for the layer to pile into.
 4. Marches the atmosphere twice, in front of the cloud and behind it. The near part fades distant
    cloud into haze (aerial perspective); the far part is the sky seen through the gaps.
-5. Composites, adds lens glare around the sun, exposes, tone maps (ACES) and dithers.
+5. Composites, adds lens glare around the sun, exposes and tone maps (ACES).
+6. Blends the result with the accumulated previous frames. See Temporal accumulation below.
+
+A second fragment entry, `fs_present`, copies the accumulated image to the screen and dithers it.
 
 The vertex shader runs three times a frame, not four million, so it computes what is the same for
 every pixel: mean sky colour (ambient light), the ground's bounce light, auto exposure, and how
@@ -85,19 +90,44 @@ shader marches Rayleigh, Mie and ozone along the view ray with one lookup into e
 Sunset reddening, twilight, and the planet's shadow all fall out of it. The sun's colour on the
 clouds comes from the same transmittance table.
 
+### Temporal accumulation
+
+Every ray starts its march at a random offset, which hides banding but leaves grain. Instead of
+more samples per frame, each frame is blended with the frames before it, so a pixel shows the
+average of roughly the last twenty.
+
+- Two history textures (half-float) swap roles each frame. The cloud pass reads one and writes
+  the other; the present pass copies the one just written to the screen.
+- `TEMPORAL_BLEND` (0.1) is the new frame's share. While the history is young the shader averages
+  evenly instead (frame n gets 1/n), so a resize or shader reload converges in a few frames.
+- Reprojection: when the camera turns, last frame's value for a direction is elsewhere on screen,
+  so the direction is projected through last frame's camera basis. The camera never travels, so
+  this is exact at any distance and there is no history rejection to tune.
+- The history is read with a 9-tap Catmull-Rom filter (`HISTORY_SHARP`). Bilinear blurs a little
+  on every read, and during a pan that compounds until the whole picture goes soft.
+- Sub-pixel jitter (`SUBPIXEL_JITTER`) aims each frame's rays through a different point of the
+  pixel, so the same average anti-aliases cloud edges and the horizon.
+- Blending happens after tone mapping, so one frame's glimpse of the sun's disc cannot outweigh
+  every other frame.
+- `Renderer::update` owns the temporal state: previous camera basis, frame counter, the jitter
+  sequences (computed in f64 on the CPU) and the history size. Callers pass a plain camera.
+- Drifting cloud and dial changes are not reprojected; they simply lag by the averaging window,
+  about a fifth of a second. No smear is visible on the nearest clouds at the default wind.
+
 ### Conventions worth knowing
 
 - Units are metres and seconds for clouds, kilometres for the atmosphere. The camera sits at
   `CAMERA_HEIGHT` (150 m, a hilltop) so the ground reaches a horizon 44 km away and fades into haze.
 - Colours are linear radiance with the sun's illuminance as 1.0. Tone mapping and sRGB encoding
   happen at the very end.
-- `Uniforms` in `src/camera.rs` and in the shader must match exactly, including the padding float
-  after each `vec3`. A mismatch gives silent garbage. `Params` is four plain floats, exactly one
-  16-byte row; a fifth dial needs three padding floats beside it on both sides.
+- `Uniforms` in `src/camera.rs` and in the shader must match exactly. Each `vec3` takes a 16-byte
+  row and uses 12, so one float follows it; four of those slots carry temporal values (`jitter`,
+  `history_frames`, `subpixel_x`, `subpixel_y`). A mismatch gives silent garbage. `Params` is four
+  plain floats, exactly one row; a fifth dial needs three padding floats beside it on both sides.
 - The atmosphere constants are duplicated in `src/atmosphere.rs` and at the top of the shader and
   must match, because the tables are baked from one and read by the other.
 - Bindings in `@group(0)`: uniforms 0 and 1, shape 2, detail 3, weather 4, transmittance 5,
-  multiple scattering 6, repeating sampler 7, clamping sampler 8.
+  multiple scattering 6, repeating sampler 7, clamping sampler 8, history 9.
 - The weather map is half-float. As 8-bit, its thresholded edges followed quantisation steps.
 - Sphere intersections and altitudes use rearranged formulas (`sphere_exit`) that never subtract
   two planet-sized numbers; the textbook forms lose all precision in 32-bit floats.
@@ -111,22 +141,48 @@ Everything runs headless, so a change can be judged without anyone at the keyboa
 - `tools/shots <name> [flags]` renders twelve standard views and tiles them into
   `out/<name>.png`. Look at this after any change to the image.
 - `tools/perf [flags]` prints GPU milliseconds for fourteen scenes at 2560x1440.
+- `tools/temporal [view flags]` scores temporal accumulation three ways, each with a control:
+  error against a converged reference, flicker between consecutive frames, and error at the end
+  of a camera pan. Run it after touching anything temporal.
 - `tools/lab run <name> [--def K=V]...` runs the scene matrix, scores it and appends a row per
   scene to `docs/experiments.jsonl`. `tools/lab report` prints the frontier so far.
 - `--def NAME=VALUE` overrides any shader `const` for one run. A name matching nothing is a hard
-  error. All three tools pass it through.
+  error. The tools pass it through.
+- `--screenshot` accumulates 32 frames by default, with the clock advancing as at 60 fps, so a
+  still shows what the window shows. `--accumulate 1` gives one raw frame. `--pan YAW,PITCH`
+  turns the camera at that rate (radians per second) over the lead-up frames, ending on the
+  requested view; that is how reprojection is tested headlessly.
+- `--bench` times the whole frame, cloud pass plus present pass, with a full history.
 - `--dump-field out.png` renders the density top-down to a linear target: R is density a third of
   the way up the layer, G the same without detail, B the weather map's cover signal.
 
 `tools/fieldstat` scores a field dump for repetition (`tile_lock`, `acorr_peak`, `axis_bias`) and
 `tools/imgstat` scores a render for contrast and detail. Current field scores: `acorr_peak` 0.40
-against a floor of 0.26, `tile_lock` 0.15, `axis_bias` 1.41.
+against a floor of 0.26, `tile_lock` 0.15, `axis_bias` 1.41. The `detail` score fell by about a
+fifth when accumulation went in, because it had been counting grain as detail.
 
-Two cautions, both learned the hard way:
+Current temporal scores, RMS in 8-bit levels at 1920x1080, whole image and edge pixels:
+
+| | all | edges |
+| --- | --- | --- |
+| error, one raw frame | 1.28 | 6.03 |
+| error, accumulated | 0.41 | 1.27 |
+| error, control (a second reference) | 0.16 | 0.74 |
+| flicker, no accumulation | 1.91 | 9.12 |
+| flicker, accumulated | 0.22 | 0.84 |
+| pan at 0.5 rad/s | 0.72 | 2.90 |
+| pan, bilinear history | 1.11 | 4.71 |
+| pan, control (no reprojection) | 12.22 | 16.13 |
+
+Three cautions, all learned the hard way:
 
 - SSIM is only meaningful when the two images are meant to depict the same thing, such as more
   march steps against fewer.
 - Every metric needs a control with a known answer before it is believed.
+- A control must be able to fail independently. The first temporal reference was the renderer
+  averaging 512 frames itself; it stalls in half-float precision and comes out biased at edges.
+  Its control was a second copy made the same way, which shared the bias and agreed perfectly.
+  The reference is now averaged on the CPU from independent raw frames.
 
 ## Running it
 
@@ -163,37 +219,41 @@ what looks wrong before reporting the work as done.
 
 ## Performance
 
-The target is 60 fps at 2560x1440, so the cloud pass is budgeted at 13 ms. Measured on an AMD
-RX 7800 XT (RADV, Mesa 24.2.8) with `--bench`, which times the pass with GPU timestamp queries.
+The target is 60 fps at 2560x1440, so the frame is budgeted at 13 ms. Measured on an AMD
+RX 7800 XT (RADV, Mesa 24.2.8) with `--bench`, which times the frame with GPU timestamp queries.
 An effect is only real above 0.016 ms.
 
 | scene | ms | | scene | ms |
 | --- | --- | --- | --- | --- |
-| overcast, 500 m features | 10.3 | | default | 5.4 |
-| overcast, looking up | 9.0 | | horizon | 4.7 |
-| into the sun | 6.3 | | sparse (coverage 0.15) | 2.6 |
-| looking straight up | 6.8 | | ground only | 1.3 |
+| overcast, 500 m features | 10.5 | | default | 5.6 |
+| overcast, looking up | 9.1 | | horizon | 4.8 |
+| into the sun | 6.5 | | sparse (coverage 0.15) | 2.8 |
+| looking straight up | 6.9 | | ground only | 1.4 |
 
-Worst case found is 10.3 ms, 2.7 ms inside the budget. Cost follows how much of the screen is
+Worst case found is 10.5 ms, 2.5 ms inside the budget. Cost follows how much of the screen is
 cloud surface: each ray that enters cloud takes a handful of short steps, each with a light march.
 
 Where the time goes, and the levers:
 
-- `STEP_MIN` and `STEP_GROWTH` set the in-cloud step. Halving them removed a visible hatch
-  pattern in the shading (the per-pixel jitter showing through) for about 2 ms.
 - `LIGHT_STEPS` scales the light march, which is two thirds of the frame: the overcast scene is
-  9.0 ms with eight light steps, 5.6 with four and 3.0 with none.
-- A completely clear sky costs 2.0 ms for the whole screen.
+  9.1 ms with eight light steps, 5.7 with four and 3.1 with none.
+- `STEP_MIN` and `STEP_GROWTH` set the in-cloud step. They were halved, for about 2 ms, to remove
+  a hatch pattern before accumulation existed. With accumulation the coarser pair (`STEP_MIN=28`,
+  `STEP_GROWTH=0.004`) flickers barely more (0.30 against 0.25) and takes the overcast scene from
+  9.1 to 7.0 ms, but the converged picture differs: 1.7% of pixels by more than three levels,
+  mostly thin edge features the longer strides miss. Kept fine; the 2 ms is there if needed.
+- Temporal accumulation costs 0.15 to 0.25 ms: the history reads and the present pass.
+- A completely clear sky costs 2.1 ms for the whole screen.
 
 ## Roadmap
 
 In rough order:
 
-1. Temporal accumulation: blend each frame with the reprojected previous one. The remaining
-   grain at cloud edges is jitter noise, and this is the standard cure. It would also let the
-   step counts drop.
-2. Light the air under the clouds correctly. The atmosphere march assumes sunlit air everywhere,
+1. Light the air under the clouds correctly. The atmosphere march assumes sunlit air everywhere,
    which gives overcast skies and shadowed ground a blue-violet cast.
+2. Spend what accumulation bought. Jittering the light march (`LIGHT_JITTER`) was turned off
+   because it showed as stipple; averaged over frames it should instead remove the faint shadow
+   terraces. Rendering the clouds at half resolution is the larger version of the same idea.
 3. More cloud types: a second, higher layer of thin cirrus, and anvil tops for the tallest
    cumulus. Both are a profile and a weather-map channel, not new machinery.
 4. Bake the textures with compute shaders. Worth half a second of startup, and it would put the

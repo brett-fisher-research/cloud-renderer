@@ -102,8 +102,28 @@ const MIN_TRANSMITTANCE: f32 = 0.02;
 const LOD_BIAS: f32 = -1.0;
 // Randomly offset each ray's start to turn banding into fine grain.
 const JITTER: f32 = 1.0;
-// Change the grain pattern every frame, so the eye averages it away.
+// Change the grain pattern every frame, so that averaging frames removes it.
 const JITTER_ANIMATE: bool = true;
+
+// --- Temporal accumulation --------------------------------------------------
+// Each frame is blended with the accumulated result of the frames before it,
+// so the grain above averages away over time instead of being paid for with
+// more samples per frame.
+//
+// This is the share of each new frame in the blend. 0.1 means a pixel is
+// roughly the average of the last ten to twenty frames: lower is smoother
+// but slower to follow a change (the sun moving, a dial, drifting cloud);
+// 1.0 turns accumulation off.
+const TEMPORAL_BLEND: f32 = 0.1;
+// Follow the camera when it turns, by looking up where each pixel was last
+// frame. Off, a turning camera drags a smear of old frames behind it.
+const REPROJECT: bool = true;
+// Read the history with a sharpening (Catmull-Rom) filter instead of plain
+// bilinear. Off, the picture goes soft whenever the camera turns.
+const HISTORY_SHARP: bool = true;
+// Shift each frame's rays by a different fraction of a pixel, so the average
+// also smooths hard edges (anti-aliasing). 0 = always through pixel centres.
+const SUBPIXEL_JITTER: f32 = 1.0;
 
 // --- Lighting ---------------------------------------------------------------
 // Samples marched towards the sun from each cloud sample, to find how much
@@ -188,10 +208,20 @@ struct Uniforms {
     resolution: vec2<f32>,
     time: f32,
     fov_tan: f32,       // tan(fov_y / 2)
+    // A vec3 occupies a 16-byte row but uses 12, so one float fits after
+    // each. Those slots carry the per-frame temporal values.
     cam_forward: vec3<f32>,
+    jitter: f32,            // this frame's ray-march offset, 0..1
     cam_right: vec3<f32>,
+    history_frames: f32,    // frames of valid history to blend with; 0 = none
     cam_up: vec3<f32>,
-    sun_dir: vec3<f32>, // points *towards* the sun
+    subpixel_x: f32,        // this frame's ray offset within the pixel,
+    sun_dir: vec3<f32>,     // points *towards* the sun
+    subpixel_y: f32,        // ...in pixels, -0.5..0.5
+    // Last frame's camera basis.
+    prev_forward: vec3<f32>,
+    prev_right: vec3<f32>,
+    prev_up: vec3<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -211,6 +241,9 @@ struct Params {
 @group(0) @binding(6) var multiscatter_table: texture_2d<f32>;
 @group(0) @binding(7) var noise_sampler: sampler;   // repeats
 @group(0) @binding(8) var table_sampler: sampler;   // clamps
+// The accumulated image: last frame's in `fs_main`, this frame's in
+// `fs_present`. Tone-mapped linear colour.
+@group(0) @binding(9) var history: texture_2d<f32>;
 
 // ===========================================================================
 //  Atmosphere
@@ -594,7 +627,7 @@ fn march_clouds(dir: vec3<f32>, pixel: vec2<f32>, in: VsOut) -> Clouds {
 
     var noise = pixel_noise(pixel);
     if (JITTER_ANIMATE) {
-        noise = fract(noise + 0.61803399 * floor(u.time * 60.0));
+        noise = fract(noise + u.jitter);
     }
 
     // Two step lengths. `fine` is short enough that one step through solid
@@ -782,6 +815,52 @@ fn view_ray(ndc: vec2<f32>) -> vec3<f32> {
     );
 }
 
+// Read the accumulated image at a point that may fall between pixels.
+//
+// The obvious way is bilinear filtering: blend the four nearest pixels. But
+// each blend blurs a little, and while the camera turns this happens to the
+// same image every frame, over and over, until the whole picture goes soft.
+//
+// Catmull-Rom filtering blends a 4x4 block with weights that go slightly
+// negative at the outside, which sharpens exactly as much as the blend
+// blurs. Folding pairs of pixels into single bilinear reads (the GPU does
+// that blend for free) gets the sixteen pixels in nine fetches. When the
+// point is exactly a pixel centre — a still camera — the weights collapse
+// to that one pixel and nothing is filtered at all.
+fn sample_history(uv: vec2<f32>) -> vec3<f32> {
+    if (!HISTORY_SHARP) {
+        return textureSampleLevel(history, table_sampler, uv, 0.0).rgb;
+    }
+    let size = u.resolution;
+    let p = uv * size;
+    let centre = floor(p - 0.5) + 0.5;   // the pixel centre just before p
+    let f = p - centre;                  // how far past it, 0..1
+
+    // Catmull-Rom weights for the four pixels along one axis.
+    let w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    let w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    let w3 = f * f * (-0.5 + 0.5 * f);
+    // The middle two as one bilinear read, placed between them.
+    let w12 = w1 + w2;
+    let t0 = (centre - 1.0) / size;
+    let t12 = (centre + w2 / w12) / size;
+    let t3 = (centre + 2.0) / size;
+
+    var sum = vec3<f32>(0.0);
+    sum += textureSampleLevel(history, table_sampler, vec2<f32>(t0.x, t0.y), 0.0).rgb * (w0.x * w0.y);
+    sum += textureSampleLevel(history, table_sampler, vec2<f32>(t12.x, t0.y), 0.0).rgb * (w12.x * w0.y);
+    sum += textureSampleLevel(history, table_sampler, vec2<f32>(t3.x, t0.y), 0.0).rgb * (w3.x * w0.y);
+    sum += textureSampleLevel(history, table_sampler, vec2<f32>(t0.x, t12.y), 0.0).rgb * (w0.x * w12.y);
+    sum += textureSampleLevel(history, table_sampler, vec2<f32>(t12.x, t12.y), 0.0).rgb * (w12.x * w12.y);
+    sum += textureSampleLevel(history, table_sampler, vec2<f32>(t3.x, t12.y), 0.0).rgb * (w3.x * w12.y);
+    sum += textureSampleLevel(history, table_sampler, vec2<f32>(t0.x, t3.y), 0.0).rgb * (w0.x * w3.y);
+    sum += textureSampleLevel(history, table_sampler, vec2<f32>(t12.x, t3.y), 0.0).rgb * (w12.x * w3.y);
+    sum += textureSampleLevel(history, table_sampler, vec2<f32>(t3.x, t3.y), 0.0).rgb * (w3.x * w3.y);
+    // Negative weights can overshoot at a hard edge. Keep it a valid colour.
+    return clamp(sum, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 // ACES filmic curve (Narkowicz's fit): near-linear in the mid-tones, with a
 // soft shoulder so sunlit cloud rolls off to white instead of clipping.
 fn tone_map(x: vec3<f32>) -> vec3<f32> {
@@ -791,7 +870,10 @@ fn tone_map(x: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let pixel = in.clip_pos.xy;
-    let dir = view_ray(in.ndc);
+    // Aim through a slightly different point of the pixel each frame. One
+    // pixel is 2/resolution wide in ndc, which spans -1..1.
+    let dir = view_ray(in.ndc
+        + vec2<f32>(u.subpixel_x, u.subpixel_y) * SUBPIXEL_JITTER * 2.0 / u.resolution);
 
     // The view ray, in the atmosphere's terms (km).
     let cam_h = CAMERA_HEIGHT * 0.001;
@@ -857,10 +939,60 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     col = tone_map(col * in.exposure * dials.exposure);
 
+    // Temporal accumulation: blend with what this spot of sky looked like
+    // over the previous frames.
+    //
+    // "This spot" is the catch. If the camera has turned, last frame's
+    // result for this direction is at a different place on screen, so the
+    // direction is projected through last frame's camera to find it
+    // ("reprojection"). The camera only turns, never travels, so that is
+    // exact however far away the thing in view is.
+    //
+    // Blending happens after tone mapping on purpose. Averaged before it,
+    // one frame's sample of something enormously bright (the sun's disc
+    // through a gap) would outweigh every other frame.
+    let centre = view_ray(in.ndc);
+    let depth = dot(centre, u.prev_forward);
+    let aspect = u.resolution.x / u.resolution.y;
+    let was_at = vec2<f32>(
+        dot(centre, u.prev_right) / (depth * aspect * u.fov_tan),
+        dot(centre, u.prev_up) / (depth * u.fov_tan));
+    var uv = vec2<f32>(0.5 + 0.5 * was_at.x, 0.5 - 0.5 * was_at.y);
+    if (!REPROJECT) {
+        // Blend with the same pixel regardless: correct only while the
+        // camera is still. Turn the camera to see what reprojection is for.
+        uv = pixel / u.resolution;
+    }
+    // Sampled unconditionally, then ignored if it turns out not to be
+    // usable: this direction was off screen last frame, or there is no
+    // history yet.
+    let before = sample_history(uv);
+    let usable = u.history_frames > 0.0 && depth > 0.0
+        && all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
+    if (usable) {
+        // While the history is young, average evenly — frame n gets weight
+        // 1/n — so it converges in a few frames instead of fading in.
+        let share = max(TEMPORAL_BLEND, 1.0 / (u.history_frames + 1.0));
+        col = mix(before, col, share);
+    }
+
+    return vec4<f32>(max(col, vec3<f32>(0.0)), 1.0);
+}
+
+// ===========================================================================
+//  Present: copy the accumulated image to the screen.
+// ===========================================================================
+
+@fragment
+fn fs_present(in: VsOut) -> @location(0) vec4<f32> {
+    // Exactly this pixel's value, no filtering.
+    var col = textureLoad(history, vec2<i32>(in.clip_pos.xy), 0).rgb;
+
     // A smooth sky gradient in 8 bits shows visible bands. Adding less than
     // one 8-bit step of noise before rounding hides them. The target is
-    // sRGB-encoded, which is steeper in the darks, hence the scale.
-    let grain = pixel_noise(pixel + vec2<f32>(37.0, 91.0)) - 0.5;
+    // sRGB-encoded, which is steeper in the darks, hence the scale. This
+    // happens here, not before accumulating, or it would be averaged away.
+    let grain = pixel_noise(in.clip_pos.xy + vec2<f32>(37.0, 91.0)) - 0.5;
     col += grain / 255.0 * (0.25 + 2.0 * sqrt(col));
 
     // The target format is sRGB, so the GPU applies the final encoding.

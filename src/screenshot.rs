@@ -1,6 +1,6 @@
-//! Headless mode: render exactly one frame to an offscreen texture and write
-//! it out as a PNG. No window, no event loop — this is how the renderer can
-//! check its own output.
+//! Headless mode: render to an offscreen texture and write it out as a PNG.
+//! No window, no event loop — this is how the renderer can check its own
+//! output.
 
 use anyhow::{Context, Result};
 
@@ -21,8 +21,16 @@ pub struct ShotOptions {
     pub sun_elevation: Option<f32>,
     pub yaw: Option<f32>,
     pub pitch: Option<f32>,
-    pub params: Params,    /// `--def` shader constant overrides for this run.
+    pub params: Params,
+    /// `--def` shader constant overrides for this run.
     pub defines: Defines,
+    /// Frames to accumulate, the last of which is the one saved.
+    pub frames: u32,
+    /// Camera turn rate over the lead-up frames, (yaw, pitch) in radians per
+    /// second, ending at the requested view. Zero for a still camera. This
+    /// is how reprojection is tested: a pan that ends on a view should give
+    /// the same picture as holding that view.
+    pub pan: (f32, f32),
     /// Dump the raw density field instead of rendering the sky. Uses the
     /// `fs_field` entry point and a linear (non-sRGB) target, because the
     /// result is an input to a spectrum, not something to look at.
@@ -46,7 +54,7 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
     } else {
         FORMAT
     };
-    let renderer = if opts.field {
+    let mut renderer = if opts.field {
         Renderer::with_entry(&gpu, format, &opts.defines, "fs_field")?
     } else {
         Renderer::new(&gpu, format, &opts.defines)?
@@ -93,8 +101,34 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
         opts.params.shadow_strength,
         opts.params.exposure
     );
-    renderer.update(&gpu, &camera.uniforms(width, height, opts.time));
     renderer.update_params(&gpu, &opts.params);
+
+    // The window shows the average of the last several frames, so one frame
+    // alone is not what anyone would see. Run the lead-up frames first, with
+    // the clock advancing as it would at 60 fps so that anything the
+    // accumulation smears (drifting cloud) is smeared in the still too.
+    let frames = if opts.field { 1 } else { opts.frames.max(1) };
+    for i in 0..frames - 1 {
+        // Seconds before the final frame.
+        let back = (frames - 1 - i) as f32 / 60.0;
+        let moving = Camera {
+            yaw: camera.yaw - opts.pan.0 * back,
+            pitch: camera.pitch - opts.pan.1 * back,
+            sun_elevation: camera.sun_elevation,
+            sun_azimuth: camera.sun_azimuth,
+        };
+        renderer.update(&gpu, &moving.uniforms(width, height, opts.time - back));
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("screenshot lead-up"),
+            });
+        renderer.draw(&mut encoder, &view);
+        // One submit per frame: the uniform upload above takes effect for
+        // the commands submitted after it.
+        gpu.queue.submit(Some(encoder.finish()));
+    }
+    renderer.update(&gpu, &camera.uniforms(width, height, opts.time));
 
     // GPU texture rows must start on a 256-byte boundary when copied to a
     // buffer, so the readback buffer may be wider than the image itself.

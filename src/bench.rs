@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::camera::Camera;
+use crate::camera::{Camera, Uniforms};
 use crate::defines::Defines;
 use crate::gpu::{create_instance, Gpu};
 use crate::params::Params;
@@ -48,7 +48,7 @@ pub fn run(opts: &BenchOptions) -> Result<()> {
     {
         anyhow::bail!("this adapter has no TIMESTAMP_QUERY support, cannot benchmark");
     }
-    let renderer = Renderer::new(&gpu, FORMAT, &opts.defines)?;
+    let mut renderer = Renderer::new(&gpu, FORMAT, &opts.defines)?;
 
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("bench target"),
@@ -76,7 +76,7 @@ pub fn run(opts: &BenchOptions) -> Result<()> {
     if let Some(p) = opts.pitch {
         camera.pitch = p;
     }
-    renderer.update(&gpu, &camera.uniforms(width, height, opts.time));
+    let uniforms = camera.uniforms(width, height, opts.time);
     renderer.update_params(&gpu, &opts.params);
 
     // Two timestamps (start, end) per pass.
@@ -104,14 +104,14 @@ pub fn run(opts: &BenchOptions) -> Result<()> {
     // Warm up: first submit pays for shader compilation, memory allocation and
     // clocking the GPU up out of its idle power state.
     for _ in 0..2 {
-        let batch = time_batch(&gpu, &renderer, &view, &query_set, &resolve, &readback)?;
+        let batch = time_batch(&gpu, &mut renderer, &uniforms, &view, &query_set, &resolve, &readback)?;
         let _ = batch;
     }
 
     let mut samples: Vec<f64> = Vec::with_capacity(opts.frames as usize);
     let wall = std::time::Instant::now();
     while samples.len() < opts.frames as usize {
-        let batch = time_batch(&gpu, &renderer, &view, &query_set, &resolve, &readback)?;
+        let batch = time_batch(&gpu, &mut renderer, &uniforms, &view, &query_set, &resolve, &readback)?;
         for ticks in batch {
             samples.push(ticks * period / 1.0e6); // ns -> ms
         }
@@ -154,7 +154,8 @@ pub fn run(opts: &BenchOptions) -> Result<()> {
 /// read the elapsed ticks back.
 fn time_batch(
     gpu: &Gpu,
-    renderer: &Renderer,
+    renderer: &mut Renderer,
+    uniforms: &Uniforms,
     view: &wgpu::TextureView,
     query_set: &wgpu::QuerySet,
     resolve: &wgpu::Buffer,
@@ -166,16 +167,14 @@ fn time_batch(
             label: Some("bench encoder"),
         });
 
+    // One uniform upload per batch. Every frame in the batch therefore shares
+    // its random offsets, which changes the picture but not the work: after
+    // the first batch each frame reads a full history, as in the window.
+    renderer.update(gpu, uniforms);
     for i in 0..BATCH {
-        renderer.draw_timed(
-            &mut encoder,
-            view,
-            Some(wgpu::RenderPassTimestampWrites {
-                query_set,
-                beginning_of_pass_write_index: Some(i * 2),
-                end_of_pass_write_index: Some(i * 2 + 1),
-            }),
-        );
+        // The timestamps bracket the whole frame: the cloud pass and the
+        // present pass after it.
+        renderer.draw_timed(&mut encoder, view, Some((query_set, i * 2)));
     }
     encoder.resolve_query_set(query_set, 0..BATCH * 2, resolve, 0);
     encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, (BATCH * 2 * 8) as u64);

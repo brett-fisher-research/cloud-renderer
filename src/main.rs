@@ -35,6 +35,10 @@ struct Args {
     /// Headless benchmark instead of a window or a screenshot.
     bench: bool,
     bench_frames: u32,
+    /// Frames a screenshot accumulates before the one it saves.
+    accumulate: u32,
+    /// Camera turn rate during a screenshot's lead-up frames (yaw, pitch).
+    pan: (f32, f32),
     /// Free-text tag printed with the benchmark line.
     label: String,
     /// Render size in real pixels: window size, or screenshot size.
@@ -59,6 +63,8 @@ fn parse_args() -> Result<Args> {
         field: false,
         bench: false,
         bench_frames: 48,
+        accumulate: 32,
+        pan: (0.0, 0.0),
         label: String::from("bench"),
         size: DEFAULT_SIZE,
         fullscreen: false,
@@ -95,6 +101,15 @@ fn parse_args() -> Result<Args> {
             "--bench-frames" => {
                 let v = it.next().context("--bench-frames needs a count")?;
                 args.bench_frames = v.parse().with_context(|| format!("bad --bench-frames: {v}"))?;
+            }
+            "--accumulate" => {
+                let v = it.next().context("--accumulate needs a frame count")?;
+                args.accumulate = v.parse().with_context(|| format!("bad --accumulate: {v}"))?;
+            }
+            "--pan" => {
+                let v = it.next().context("--pan needs YAW,PITCH in radians per second")?;
+                let (y, p) = v.split_once(',').context("--pan needs YAW,PITCH")?;
+                args.pan = (y.trim().parse()?, p.trim().parse()?);
             }
             "--label" => {
                 args.label = it.next().context("--label needs a string")?;
@@ -149,6 +164,10 @@ fn parse_args() -> Result<Args> {
                      --dump-field <out.png>          top-down density field, linear, for analysis\n\
                                                      (R full, G no detail, B weather cover; 1024^2)\n\
                      --time <seconds>                animation time for the screenshot\n\
+                     --accumulate <n>                frames a screenshot blends, as the window\n\
+                                                     does over time (default 32; 1 = one raw frame)\n\
+                     --pan <yaw,pitch>               turn the camera at this rate (rad/s) over those\n\
+                                                     frames, ending on the requested view\n\
                      --sun <radians>                 sun elevation (0 = horizon, 1.57 = zenith)\n\
                      --yaw, --pitch <radians>        camera direction for the screenshot\n\
                      --no-vsync                      uncap the frame rate (benchmarking)\n\
@@ -221,6 +240,8 @@ fn main() -> Result<()> {
                 params: args.params,
                 defines: args.defines,
                 field: args.field,
+                frames: args.accumulate,
+                pan: args.pan,
             },
         ),
         None => app::App::run(

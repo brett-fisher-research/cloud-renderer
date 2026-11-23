@@ -1,0 +1,132 @@
+#!/usr/bin/env -S uv run --script
+# usage: tools/temporal [view flags, e.g. --yaw 2.2 --pitch 0.3] [--def K=V]...
+# desc: Score temporal accumulation: error against a converged reference, flicker, and camera pans
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pillow", "numpy"]
+# ///
+"""Does temporal accumulation do its job, and does it do any harm?
+
+Three questions, each with a control whose answer is known in advance:
+
+  error    How far is a frame from the converged picture? Scored against
+           the mean of 64 independent raw frames. Control: a second such
+           mean from 64 different frames, which should score near zero.
+  flicker  How much do two consecutive frames differ with nothing moving?
+           That difference is the crawl the eye sees. Control: the same
+           frame rendered twice, which must score exactly zero.
+  pans     Does a camera turn that ends on a view give the picture that
+           holding the view gives? Control: the same pan with reprojection
+           off, which should score far worse.
+
+The clouds are frozen for every render, so nothing counts as error except
+noise and smear. Numbers are RMS differences in 8-bit levels; "edges" is the
+few percent of pixels where the picture changes fastest, which is where the
+grain lives.
+
+The reference is averaged here on the CPU, in linear light, on purpose. Asking
+the renderer to average 512 frames itself (TEMPORAL_BLEND=0) does not work: in
+half floats a 1/400 nudge rounds away, asymmetrically at edges, so the result
+is biased — and a second copy, biased the same way, agrees with it perfectly.
+"""
+
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parent.parent
+BIN = ROOT / "target" / "release" / "cloud-renderer"
+OUT = ROOT / "out" / "temporal"
+
+VIEW = sys.argv[1:] or ["--yaw", "2.2", "--pitch", "0.3"]
+# WIND cannot be exactly zero: the shader normalises it.
+FREEZE = ["--def", "WIND=vec3<f32>(0.001, 0.0, 0.0)", "--def", "SHAPE_DRIFT=vec3<f32>(0.0, 0.0, 0.0)"]
+
+
+def render(name: str, *flags: str) -> np.ndarray:
+    path = OUT / f"{name}.png"
+    cmd = [str(BIN), "--screenshot", str(path), "--size", "1920x1080", *VIEW, *flags, *FREEZE]
+    p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise SystemExit(f"{name} failed:\n{p.stderr[-2000:]}")
+    return np.asarray(Image.open(path).convert("RGB"), dtype=np.float64)
+
+
+def to_linear(s: np.ndarray) -> np.ndarray:
+    s = s / 255.0
+    return np.where(s <= 0.04045, s / 12.92, ((s + 0.055) / 1.055) ** 2.4)
+
+
+def to_srgb(v: np.ndarray) -> np.ndarray:
+    return 255.0 * np.where(v <= 0.0031308, v * 12.92, 1.055 * np.maximum(v, 0) ** (1 / 2.4) - 0.055)
+
+
+def raw_frame(n: int) -> np.ndarray:
+    # With TEMPORAL_BLEND=1 nothing is blended, so "accumulating" n+1 frames
+    # yields raw frame number n, with that frame's jitter.
+    return to_linear(render(f"raw{n:03d}", "--accumulate", str(n + 1), "--def", "TEMPORAL_BLEND=1.0"))
+
+
+def mean_of(frames: range) -> np.ndarray:
+    with ThreadPoolExecutor(4) as pool:
+        return to_srgb(np.mean(list(pool.map(raw_frame, frames)), axis=0))
+
+
+def rms(a: np.ndarray, b: np.ndarray, mask: np.ndarray | None = None) -> float:
+    d = (a - b) ** 2
+    return float(np.sqrt((d[mask] if mask is not None else d).mean()))
+
+
+def main() -> None:
+    subprocess.run(["cargo", "build", "--release", "--quiet"], cwd=ROOT, check=True)
+    OUT.mkdir(parents=True, exist_ok=True)
+
+    print("building two 64-frame references...")
+    ref = mean_of(range(0, 64))
+    ref2 = mean_of(range(64, 128))
+    gy, gx = np.gradient(ref.mean(axis=2))
+    edges = np.hypot(gx, gy) > 6.0
+    print(f"edge pixels: {edges.mean() * 100:.1f}% of the image\n")
+
+    def table(title: str, rows: list[tuple[str, np.ndarray, np.ndarray]]) -> None:
+        print(f"{title:44s} {'all':>7s} {'edges':>7s}")
+        for name, a, b in rows:
+            print(f"  {name:42s} {rms(a, b):7.2f} {rms(a, b, edges):7.2f}")
+        print()
+
+    table("error against the reference", [
+        ("control: a second reference", ref2, ref),
+        ("one raw frame", render("one", "--accumulate", "1"), ref),
+        ("accumulated, 32 frames", render("acc32", "--accumulate", "32"), ref),
+        ("accumulated, 120 frames", render("acc120", "--accumulate", "120"), ref),
+    ])
+
+    def pair(name: str, *flags: str) -> tuple[np.ndarray, np.ndarray]:
+        return (render(f"{name}-a", "--accumulate", "90", *flags),
+                render(f"{name}-b", "--accumulate", "91", *flags))
+
+    same = (render("same-a", "--accumulate", "90"), render("same-b", "--accumulate", "90"))
+    table("flicker between consecutive frames", [
+        ("control: the same frame twice", *same),
+        ("no accumulation", *pair("flick-off", "--def", "TEMPORAL_BLEND=1.0", "--def", "SUBPIXEL_JITTER=0.0")),
+        ("accumulated", *pair("flick-on")),
+    ])
+
+    def pan(name: str, rate: str, *flags: str) -> np.ndarray:
+        return render(name, "--accumulate", "90", "--pan", rate, *flags)
+
+    table("error at the end of a camera pan", [
+        ("yaw 0.5 rad/s", pan("pan-yaw", "0.5,0.0"), ref),
+        ("pitch 0.3 rad/s", pan("pan-pitch", "0.0,0.3"), ref),
+        ("yaw 2.0 rad/s", pan("pan-fast", "2.0,0.0"), ref),
+        ("yaw 0.5 rad/s, bilinear history", pan("pan-bilinear", "0.5,0.0", "--def", "HISTORY_SHARP=false"), ref),
+        ("control: yaw 0.5 rad/s, no reprojection", pan("pan-off", "0.5,0.0", "--def", "REPROJECT=false"), ref),
+    ])
+
+
+if __name__ == "__main__":
+    main()

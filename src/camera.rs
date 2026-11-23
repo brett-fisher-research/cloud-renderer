@@ -13,8 +13,14 @@ const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.02;
 ///
 /// Graphics 101: a *uniform buffer* is a small blob of read-only data that is
 /// the same ("uniform") for every pixel in a draw call. WGSL requires `vec3`
-/// to be 16-byte aligned, so each one gets an explicit padding float — if the
-/// Rust layout and the WGSL layout disagree you get silent garbage, not an error.
+/// to be 16-byte aligned, so each one is followed by one more float to fill
+/// the row — if the Rust layout and the WGSL layout disagree you get silent
+/// garbage, not an error.
+///
+/// Those filler floats are free storage, so four of them carry the values
+/// temporal accumulation needs. [`Camera::uniforms`] leaves all the temporal
+/// fields neutral; `Renderer::update` fills them in, because the renderer is
+/// what knows about the previous frame.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Uniforms {
@@ -27,16 +33,27 @@ pub struct Uniforms {
 
     /// Camera basis: where we are looking...
     pub cam_forward: [f32; 3],
-    pub _pad0: f32,
+    /// This frame's random offset for the ray march, 0..1.
+    pub jitter: f32,
     /// ...and the screen-right and screen-up axes that go with it.
     pub cam_right: [f32; 3],
-    pub _pad1: f32,
+    /// How many frames of valid history there are to blend with. 0 = none.
+    pub history_frames: f32,
     pub cam_up: [f32; 3],
-    pub _pad2: f32,
+    /// This frame's offset of the ray within its pixel, -0.5..0.5 pixels.
+    pub subpixel_x: f32,
 
     /// Unit vector pointing *towards* the sun.
     pub sun_dir: [f32; 3],
-    pub _pad3: f32,
+    pub subpixel_y: f32,
+
+    /// Last frame's camera basis, to find where each pixel was on screen.
+    pub prev_forward: [f32; 3],
+    pub _pad0: f32,
+    pub prev_right: [f32; 3],
+    pub _pad1: f32,
+    pub prev_up: [f32; 3],
+    pub _pad2: f32,
 }
 
 /// Mouse-driven look-around camera. It never moves; only the orientation and
@@ -116,13 +133,19 @@ impl Camera {
             time,
             fov_tan: (FOV_Y_DEG.to_radians() * 0.5).tan(),
             cam_forward: forward.into(),
-            _pad0: 0.0,
+            jitter: 0.0,
             cam_right: right.into(),
-            _pad1: 0.0,
+            history_frames: 0.0,
             cam_up: up.into(),
-            _pad2: 0.0,
+            subpixel_x: 0.0,
             sun_dir: self.sun_dir().into(),
-            _pad3: 0.0,
+            subpixel_y: 0.0,
+            prev_forward: forward.into(),
+            _pad0: 0.0,
+            prev_right: right.into(),
+            _pad1: 0.0,
+            prev_up: up.into(),
+            _pad2: 0.0,
         }
     }
 }

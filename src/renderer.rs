@@ -1,58 +1,99 @@
-//! The whole GPU-side pipeline: one full-screen triangle, one uniform buffer,
-//! and the cloud shader — plus hot-reloading of that shader.
+//! The whole GPU-side pipeline: one full-screen triangle, the cloud shader,
+//! temporal accumulation, and hot-reloading of that shader.
+//!
+//! Graphics note: *temporal accumulation* spreads work over time. The cloud
+//! march starts every ray at a random offset, which hides banding but leaves
+//! grain. Rather than take more samples per frame, each frame is blended
+//! with the result of the frames before it, so every pixel shows the average
+//! of the last dozen or so — the same samples a slower renderer would take
+//! in one frame, collected over a fifth of a second instead.
+//!
+//! That needs somewhere to keep the previous result, so a frame is two passes:
+//!
+//! 1. **Clouds**: render into a *history* texture, reading the other history
+//!    texture (last frame's result) and blending with it.
+//! 2. **Present**: copy the texture just written to the screen.
+//!
+//! The two history textures swap roles every frame ("ping-pong"), because a
+//! pass may not read the texture it is writing.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::atmosphere;
 use crate::camera::Uniforms;
 use crate::defines::Defines;
-use crate::atmosphere;
-use crate::noise;
 use crate::gpu::Gpu;
+use crate::noise;
 use crate::params::Params;
 
 /// Where the shader lives, relative to the crate root.
 pub const SHADER_PATH: &str = "shaders/clouds.wgsl";
+
+/// Half floats: the accumulated image is an average of many frames, and 8
+/// bits would round each blend step and never quite converge.
+const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// The accumulated image, twice over. `bind_groups[i]` is the full set of
+/// shader inputs with `views[i]` bound as the history to read.
+struct History {
+    size: (u32, u32),
+    views: [wgpu::TextureView; 2],
+    bind_groups: [wgpu::BindGroup; 2],
+}
+
+/// The last pipelines that compiled successfully. A failed hot-reload leaves
+/// these untouched, which is what keeps us rendering instead of crashing.
+struct Pipelines {
+    clouds: wgpu::RenderPipeline,
+    /// `None` when drawing straight to the target (the field dump).
+    present: Option<wgpu::RenderPipeline>,
+}
 
 pub struct Renderer {
     /// GPU-side copy of [`Uniforms`], rewritten every frame.
     uniform_buffer: wgpu::Buffer,
     /// GPU-side copy of [`Params`], rewritten only when a dial moves.
     params_buffer: wgpu::Buffer,
-    /// Binds both buffers to `@group(0)` bindings 0 and 1 in the shader.
-    bind_group: wgpu::BindGroup,
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
-    /// The last pipeline that compiled successfully. A failed hot-reload leaves
-    /// this untouched, which is what keeps us rendering instead of crashing.
-    pipeline: wgpu::RenderPipeline,
-    /// Tiling 3D noise, baked once at startup. Keeps the textures alive for
-    /// as long as the bind group that references them.
-    #[allow(dead_code)]
-    textures: [wgpu::Texture; 5],
-    /// Format of whatever we draw into (swapchain texture, or offscreen RGBA).
+    pipelines: Pipelines,
+    /// Views of the five baked textures, kept so the bind groups can be
+    /// rebuilt when the history textures are resized.
+    baked: [wgpu::TextureView; 5],
+    noise_sampler: wgpu::Sampler,
+    table_sampler: wgpu::Sampler,
+    history: History,
+    /// Which history texture the next frame draws into.
+    write: usize,
+    /// Frames drawn since the history was last valid from scratch. The
+    /// shader averages evenly until this is large, so a fresh history
+    /// converges in a few frames instead of fading in.
+    history_frames: u32,
+    /// Counts every frame, to step the jitter sequences.
+    frame: u32,
+    /// Last frame's camera basis, for finding where a pixel was on screen.
+    prev_basis: Option<[[f32; 3]; 3]>,
+    /// Format of whatever we present into (swapchain, or offscreen RGBA).
     target_format: wgpu::TextureFormat,
     shader_path: PathBuf,
     /// `--def` overrides, re-applied on every hot-reload so a sweep's
     /// constants survive editing the file while it runs.
     defines: Defines,
-    /// Which fragment entry point this pipeline draws.
+    /// Which fragment entry point draws the image.
     entry: &'static str,
 }
 
 impl Renderer {
-    pub fn new(
-        gpu: &Gpu,
-        target_format: wgpu::TextureFormat,
-        defines: &Defines,
-    ) -> Result<Self> {
+    pub fn new(gpu: &Gpu, target_format: wgpu::TextureFormat, defines: &Defines) -> Result<Self> {
         Self::with_entry(gpu, target_format, defines, "fs_main")
     }
 
     /// As [`Renderer::new`], but drawing a different fragment entry point.
-    /// `--dump-field` uses this to run `fs_field` through the same
-    /// pipeline, bindings and noise textures as the real renderer.
+    /// `--dump-field` uses this to run `fs_field` through the same bindings
+    /// and noise textures as the real renderer. Anything but `fs_main` draws
+    /// straight to the target with no accumulation: a field dump is data.
     pub fn with_entry(
         gpu: &Gpu,
         target_format: wgpu::TextureFormat,
@@ -76,28 +117,15 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        // A bind group *layout* describes the shape of the shader's inputs; the
-        // bind group is the actual set of resources matching that shape. Both
-        // uniform blocks are the same shape, so the entries only differ by
-        // binding number.
-        let uniform_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
         // Bake everything the shader samples. See `noise.rs` and
         // `atmosphere.rs` for what each texture holds and why.
         let noise_shape = noise::bake_shape(device, &gpu.queue, 128);
         let noise_detail = noise::bake_detail(device, &gpu.queue, 64);
         let weather = noise::bake_weather(device, &gpu.queue, 512);
         let (transmittance, multiscatter) = atmosphere::bake(device, &gpu.queue);
+        // A view keeps its texture alive, so the views are all we hold on to.
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
-        let views = [
+        let baked = [
             view(&noise_shape),
             view(&noise_detail),
             view(&weather),
@@ -119,6 +147,7 @@ impl Renderer {
         });
         // The atmosphere tables are functions, not patterns: reading past
         // the edge must clamp to the last value, not wrap to the other side.
+        // The history texture is read through this one too.
         let table_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("table sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -126,10 +155,23 @@ impl Renderer {
             ..Default::default()
         });
 
+        // A bind group *layout* describes the shape of the shader's inputs;
+        // the bind group is the actual set of resources matching that shape.
+        //
         // The vertex stage reads the tables too: it works out the handful of
         // per-frame colours (ambient sky light, exposure) once per vertex
         // instead of once per pixel.
         let both = wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX;
+        let uniform_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: both,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let texture_entry =
             |binding: u32, view_dimension: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
                 binding,
@@ -160,31 +202,8 @@ impl Renderer {
                 texture_entry(6, wgpu::TextureViewDimension::D2),
                 sampler_entry(7),
                 sampler_entry(8),
+                texture_entry(9, wgpu::TextureViewDimension::D2),
             ],
-        });
-
-        let mut entries = vec![
-            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
-        ];
-        for (i, v) in views.iter().enumerate() {
-            entries.push(wgpu::BindGroupEntry {
-                binding: 2 + i as u32,
-                resource: wgpu::BindingResource::TextureView(v),
-            });
-        }
-        entries.push(wgpu::BindGroupEntry {
-            binding: 7,
-            resource: wgpu::BindingResource::Sampler(&noise_sampler),
-        });
-        entries.push(wgpu::BindGroupEntry {
-            binding: 8,
-            resource: wgpu::BindingResource::Sampler(&table_sampler),
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cloud bind group"),
-            layout: &bind_group_layout,
-            entries: &entries,
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -205,17 +224,36 @@ impl Renderer {
 
         // On first load a broken shader is fatal — there is no "last good"
         // version to fall back to yet.
-        let pipeline = build_pipeline(gpu, &pipeline_layout, target_format, &source, entry)
+        let pipelines = build_pipelines(gpu, &pipeline_layout, target_format, &source, entry)
             .map_err(|e| anyhow::anyhow!("shader failed to compile:\n{e}"))?;
+
+        // A placeholder history. The first `update` replaces it with one
+        // the size of the frame.
+        let history = make_history(
+            device,
+            &bind_group_layout,
+            &uniform_buffer,
+            &params_buffer,
+            &baked,
+            &noise_sampler,
+            &table_sampler,
+            (1, 1),
+        );
 
         Ok(Self {
             uniform_buffer,
             params_buffer,
-            bind_group,
             bind_group_layout,
             pipeline_layout,
-            pipeline,
-            textures: [noise_shape, noise_detail, weather, transmittance, multiscatter],
+            pipelines,
+            baked,
+            noise_sampler,
+            table_sampler,
+            history,
+            write: 0,
+            history_frames: 0,
+            frame: 0,
+            prev_basis: None,
             target_format,
             shader_path,
             defines: defines.clone(),
@@ -223,24 +261,21 @@ impl Renderer {
         })
     }
 
-    /// Re-read the shader from disk and swap in a new pipeline.
+    /// Re-read the shader from disk and swap in new pipelines.
     ///
     /// Returns `Ok(())` if the new shader compiled. On failure the error is
-    /// returned and the previously working pipeline stays in place.
+    /// returned and the previously working pipelines stay in place.
     pub fn reload_shader(&mut self, gpu: &Gpu) -> Result<()> {
         let source = std::fs::read_to_string(&self.shader_path)
             .with_context(|| format!("could not read {}", self.shader_path.display()))?;
         let source = self.defines.apply(&source)?;
 
-        match build_pipeline(
-            gpu,
-            &self.pipeline_layout,
-            self.target_format,
-            &source,
-            self.entry,
-        ) {
-            Ok(pipeline) => {
-                self.pipeline = pipeline;
+        match build_pipelines(gpu, &self.pipeline_layout, self.target_format, &source, self.entry) {
+            Ok(pipelines) => {
+                self.pipelines = pipelines;
+                // The old history was drawn by the old shader. Start again
+                // so an edit shows at once instead of fading in.
+                self.history_frames = 0;
                 log::info!("shader reloaded OK");
                 Ok(())
             }
@@ -252,76 +287,240 @@ impl Renderer {
         &self.shader_path
     }
 
-    /// Upload this frame's camera uniforms.
-    pub fn update(&self, gpu: &Gpu, uniforms: &Uniforms) {
+    /// Upload this frame's camera uniforms. Call once per frame, before
+    /// [`Renderer::draw`].
+    ///
+    /// The camera fills in where it is looking; this adds everything to do
+    /// with *time* — last frame's view, this frame's random offsets, how
+    /// much history there is — so no caller has to track it.
+    pub fn update(&mut self, gpu: &Gpu, uniforms: &Uniforms) {
+        let size = (
+            (uniforms.resolution[0] as u32).max(1),
+            (uniforms.resolution[1] as u32).max(1),
+        );
+        if size != self.history.size {
+            log::info!("history textures: {}x{}", size.0, size.1);
+            self.history = make_history(
+                &gpu.device,
+                &self.bind_group_layout,
+                &self.uniform_buffer,
+                &self.params_buffer,
+                &self.baked,
+                &self.noise_sampler,
+                &self.table_sampler,
+                size,
+            );
+            self.history_frames = 0;
+        }
+
+        let mut u = *uniforms;
+        let basis = [u.cam_forward, u.cam_right, u.cam_up];
+        let prev = self.prev_basis.unwrap_or(basis);
+        u.prev_forward = prev[0];
+        u.prev_right = prev[1];
+        u.prev_up = prev[2];
+        self.prev_basis = Some(basis);
+
+        // Low-discrepancy sequences: each new value lands in the biggest gap
+        // left by the ones before, so a short run of frames covers 0..1
+        // evenly. Random numbers would clump and converge more slowly.
+        // Computed in f64 here because a large frame count times an
+        // irrational loses its fraction in a shader's 32-bit floats.
+        let n = self.frame as f64;
+        u.jitter = (n * 0.618_033_988_749_894_9).fract() as f32;
+        u.subpixel_x = ((0.5 + n * 0.754_877_666_246_692_7).fract() - 0.5) as f32;
+        u.subpixel_y = ((0.5 + n * 0.569_840_290_998_053_2).fract() - 0.5) as f32;
+        u.history_frames = self.history_frames as f32;
+        self.frame = self.frame.wrapping_add(1);
+
         gpu.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&u));
     }
 
-    /// Upload the cloud dials. Cheap enough (32 bytes) to send every frame
+    /// Upload the cloud dials. Cheap enough (16 bytes) to send every frame
     /// rather than tracking whether a slider actually moved.
     pub fn update_params(&self, gpu: &Gpu, params: &Params) {
         gpu.queue
             .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
     }
 
-    /// Record the single full-screen draw into `encoder`.
-    pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+    /// Record one frame into `encoder`, ending with the image in `view`.
+    pub fn draw(&mut self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
         self.draw_timed(encoder, view, None);
     }
 
     /// As [`Renderer::draw`], but optionally asks the GPU to write its own
-    /// clock at the start and end of the pass. That is how `--bench` measures
-    /// the cloud pass by itself, with no vsync or compositor in the number.
+    /// clock at the start and end of the frame. `query` is the query set and
+    /// the index of the first of two slots. That is how `--bench` measures
+    /// the frame by itself, with no vsync or compositor in the number.
     pub fn draw_timed(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
-        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+        query: Option<(&wgpu::QuerySet, u32)>,
     ) {
-        // A render pass is a scope that targets one or more textures. Ours
-        // clears the target and then draws three vertices over it.
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("cloud pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    // The clear colour never shows; the shader covers every pixel.
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes,
-            occlusion_query_set: None,
-            multiview_mask: None,
+        let start = query.map(|(query_set, index)| wgpu::RenderPassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(index),
+            end_of_pass_write_index: None,
+        });
+        let end = query.map(|(query_set, index)| wgpu::RenderPassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: None,
+            end_of_pass_write_index: Some(index + 1),
         });
 
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
-        // Three vertices, no vertex buffer: the vertex shader generates a
-        // triangle big enough to cover the screen from the vertex index alone.
-        pass.draw(0..3, 0..1);
-    }
+        let Some(present) = &self.pipelines.present else {
+            // No accumulation: one pass, straight to the target.
+            let both = query.map(|(query_set, index)| wgpu::RenderPassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(index),
+                end_of_pass_write_index: Some(index + 1),
+            });
+            fullscreen_pass(
+                encoder,
+                "field pass",
+                view,
+                &self.pipelines.clouds,
+                &self.history.bind_groups[0],
+                both,
+            );
+            return;
+        };
 
-    /// Unused for now, but keeps the layout alive and documents the binding.
-    #[allow(dead_code)]
-    pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
-        &self.bind_group_layout
+        let read = 1 - self.write;
+        // Clouds: read last frame's result, write this frame's.
+        fullscreen_pass(
+            encoder,
+            "cloud pass",
+            &self.history.views[self.write],
+            &self.pipelines.clouds,
+            &self.history.bind_groups[read],
+            start,
+        );
+        // Present: read what was just written, write the screen.
+        fullscreen_pass(
+            encoder,
+            "present pass",
+            view,
+            present,
+            &self.history.bind_groups[self.write],
+            end,
+        );
+
+        self.write = read;
+        self.history_frames = (self.history_frames + 1).min(1 << 20);
     }
 }
 
-/// Compile WGSL and build a render pipeline, capturing validation errors
+/// One render pass drawing the full-screen triangle.
+///
+/// A render pass is a scope that targets one or more textures. Three
+/// vertices, no vertex buffer: the vertex shader generates a triangle big
+/// enough to cover the screen from the vertex index alone.
+fn fullscreen_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    target: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                // The clear colour never shows; the shader covers every pixel.
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.draw(0..3, 0..1);
+}
+
+/// Create the two history textures and a bind group reading each.
+#[allow(clippy::too_many_arguments)]
+fn make_history(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniform_buffer: &wgpu::Buffer,
+    params_buffer: &wgpu::Buffer,
+    baked: &[wgpu::TextureView; 5],
+    noise_sampler: &wgpu::Sampler,
+    table_sampler: &wgpu::Sampler,
+    size: (u32, u32),
+) -> History {
+    let make_view = |label: &str| {
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: HISTORY_FORMAT,
+                // Drawn into on one frame, sampled on the next.
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default())
+    };
+    let views = [make_view("history a"), make_view("history b")];
+
+    let make_group = |history: &wgpu::TextureView| {
+        let mut entries = vec![
+            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
+        ];
+        for (i, v) in baked.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 2 + i as u32,
+                resource: wgpu::BindingResource::TextureView(v),
+            });
+        }
+        entries.push(wgpu::BindGroupEntry {
+            binding: 7,
+            resource: wgpu::BindingResource::Sampler(noise_sampler),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 8,
+            resource: wgpu::BindingResource::Sampler(table_sampler),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 9,
+            resource: wgpu::BindingResource::TextureView(history),
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cloud bind group"),
+            layout,
+            entries: &entries,
+        })
+    };
+    let bind_groups = [make_group(&views[0]), make_group(&views[1])];
+
+    History { size, views, bind_groups }
+}
+
+/// Compile WGSL and build the render pipelines, capturing validation errors
 /// instead of letting them panic the process.
-fn build_pipeline(
+fn build_pipelines(
     gpu: &Gpu,
     layout: &wgpu::PipelineLayout,
     target_format: wgpu::TextureFormat,
     source: &str,
     entry: &str,
-) -> Result<wgpu::RenderPipeline, String> {
+) -> Result<Pipelines, String> {
     let device = &gpu.device;
 
     // An *error scope* catches validation errors produced inside it, so a typo
@@ -333,42 +532,55 @@ fn build_pipeline(
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
 
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("cloud pipeline"),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: &module,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &module,
-            entry_point: Some(entry),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: target_format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        // No vertex buffers and no depth testing: we draw one flat triangle.
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: None,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    });
+    let pipeline = |label: &str, fragment: &str, format: wgpu::TextureFormat| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some(fragment),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            // No vertex buffers and no depth testing: one flat triangle.
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+
+    // The real image accumulates in a history texture and is then presented.
+    // Anything else (the field dump) draws straight to the target.
+    let pipelines = if entry == "fs_main" {
+        Pipelines {
+            clouds: pipeline("cloud pipeline", entry, HISTORY_FORMAT),
+            present: Some(pipeline("present pipeline", "fs_present", target_format)),
+        }
+    } else {
+        Pipelines { clouds: pipeline("field pipeline", entry, target_format), present: None }
+    };
 
     // wgpu's Display already includes the full WGSL diagnostic with line
     // numbers and a caret pointing at the offending token.
     match pollster::block_on(scope.pop()) {
         Some(err) => Err(err.to_string()),
-        None => Ok(pipeline),
+        None => Ok(pipelines),
     }
 }
 
