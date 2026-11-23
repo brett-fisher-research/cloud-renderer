@@ -36,6 +36,8 @@ pub struct Renderer {
     /// `--def` overrides, re-applied on every hot-reload so a sweep's
     /// constants survive editing the file while it runs.
     defines: Defines,
+    /// Which fragment entry point this pipeline draws.
+    entry: &'static str,
 }
 
 impl Renderer {
@@ -43,6 +45,18 @@ impl Renderer {
         gpu: &Gpu,
         target_format: wgpu::TextureFormat,
         defines: &Defines,
+    ) -> Result<Self> {
+        Self::with_entry(gpu, target_format, defines, "fs_main")
+    }
+
+    /// As [`Renderer::new`], but drawing a different fragment entry point.
+    /// `--dump-field` uses this to run `fs_field` through the same
+    /// pipeline, bindings and noise textures as the real renderer.
+    pub fn with_entry(
+        gpu: &Gpu,
+        target_format: wgpu::TextureFormat,
+        defines: &Defines,
+        entry: &'static str,
     ) -> Result<Self> {
         let device = &gpu.device;
 
@@ -180,7 +194,7 @@ impl Renderer {
 
         // On first load a broken shader is fatal — there is no "last good"
         // version to fall back to yet.
-        let pipeline = build_pipeline(gpu, &pipeline_layout, target_format, &source)
+        let pipeline = build_pipeline(gpu, &pipeline_layout, target_format, &source, entry)
             .map_err(|e| anyhow::anyhow!("shader failed to compile:\n{e}"))?;
 
         Ok(Self {
@@ -194,6 +208,7 @@ impl Renderer {
             target_format,
             shader_path,
             defines: defines.clone(),
+            entry,
         })
     }
 
@@ -206,7 +221,13 @@ impl Renderer {
             .with_context(|| format!("could not read {}", self.shader_path.display()))?;
         let source = self.defines.apply(&source)?;
 
-        match build_pipeline(gpu, &self.pipeline_layout, self.target_format, &source) {
+        match build_pipeline(
+            gpu,
+            &self.pipeline_layout,
+            self.target_format,
+            &source,
+            self.entry,
+        ) {
             Ok(pipeline) => {
                 self.pipeline = pipeline;
                 log::info!("shader reloaded OK");
@@ -288,6 +309,7 @@ fn build_pipeline(
     layout: &wgpu::PipelineLayout,
     target_format: wgpu::TextureFormat,
     source: &str,
+    entry: &str,
 ) -> Result<wgpu::RenderPipeline, String> {
     let device = &gpu.device;
 
@@ -311,7 +333,7 @@ fn build_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: &module,
-            entry_point: Some("fs_main"),
+            entry_point: Some(entry),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: target_format,

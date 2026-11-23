@@ -23,15 +23,34 @@ pub struct ShotOptions {
     pub pitch: Option<f32>,
     pub params: Params,    /// `--def` shader constant overrides for this run.
     pub defines: Defines,
+    /// Dump the raw density field instead of rendering the sky. Uses the
+    /// `fs_field` entry point and a linear (non-sRGB) target, because the
+    /// result is an input to a spectrum, not something to look at.
+    pub field: bool,
 
 }
 
 pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
     let (width, height) = (opts.width, opts.height);
-    log::info!("headless render {width}x{height} -> {path}");
+    log::info!(
+        "headless {} {width}x{height} -> {path}",
+        if opts.field { "field dump" } else { "render" }
+    );
 
     let gpu = Gpu::new(create_instance(), None)?;
-    let renderer = Renderer::new(&gpu, FORMAT, &opts.defines)?;
+
+    // A field dump is data, not a picture: sRGB encoding on write would bend
+    // every value through a gamma curve before anything could measure it.
+    let format = if opts.field {
+        wgpu::TextureFormat::Rgba8Unorm
+    } else {
+        FORMAT
+    };
+    let renderer = if opts.field {
+        Renderer::with_entry(&gpu, format, &opts.defines, "fs_field")?
+    } else {
+        Renderer::new(&gpu, format, &opts.defines)?
+    };
 
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("screenshot target"),
@@ -43,7 +62,7 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
+        format,
         // RENDER_ATTACHMENT to draw into it, COPY_SRC to read it back.
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],

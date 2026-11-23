@@ -491,6 +491,46 @@ fn march_clouds(
 }
 
 // ---------------------------------------------------------------------------
+//  Field dump — analysis only, never drawn in the window.
+//
+//  Renders a top-down orthographic slice of the density field straight out of
+//  `cloud_density_at`, so a metric computed on it measures the real field
+//  rather than a reimplementation of it. `--dump-field` writes it to a PNG in
+//  a *linear* format, not sRGB, because a spectrum of gamma-encoded values is
+//  a spectrum of the wrong signal.
+//
+//  The patch is sized in tile units rather than metres, so dumps taken at
+//  different feature sizes line up: if the field repeats with the texture,
+//  the repeat is always FIELD_TILES cycles across the image, whatever the
+//  dial says.
+// ---------------------------------------------------------------------------
+
+const FIELD_TILES: f32 = 8.0;    // base-texture tiles across the dump
+const FIELD_HEIGHT: f32 = 0.5;   // where in the slab to slice: 0 = bottom
+
+@fragment
+fn fs_field(in: VsOut) -> @location(0) vec4<f32> {
+    let tile = dials.feature_size * TILE_SCALE;
+    let xz = in.ndc * 0.5 * FIELD_TILES * tile;
+    let y = CLOUD_BOTTOM + (CLOUD_TOP - CLOUD_BOTTOM) * FIELD_HEIGHT;
+    let p = vec3<f32>(xz.x, y, xz.y);
+
+    // Mip 0 throughout: this asks what the field *is*, not what some
+    // particular march step length would make of it.
+    let lod = vec2<f32>(0.0, 0.0);
+
+    let full = cloud_density_at(p, lod, true);
+    let base = cloud_density_at(p, lod, false);
+
+    // The raw field, before the coverage threshold. That threshold is a hard
+    // nonlinearity and manufactures harmonics of its own, so the honest input
+    // to a spectrum is the field itself.
+    let raw = cloud_noise((p + WIND * u.time) / tile, lod, true);
+
+    return vec4<f32>(full, base, raw, 1.0);
+}
+
+// ---------------------------------------------------------------------------
 //  Fragment stage
 // ---------------------------------------------------------------------------
 

@@ -29,6 +29,8 @@ const DEFAULT_SIZE: (u32, u32) = (1920, 1080);
 
 struct Args {
     screenshot: Option<String>,
+    /// Dump the density field rather than the rendered sky.
+    field: bool,
     /// Headless benchmark instead of a window or a screenshot.
     bench: bool,
     bench_frames: u32,
@@ -53,6 +55,7 @@ struct Args {
 fn parse_args() -> Result<Args> {
     let mut args = Args {
         screenshot: None,
+        field: false,
         bench: false,
         bench_frames: 48,
         label: String::from("bench"),
@@ -71,6 +74,16 @@ fn parse_args() -> Result<Args> {
         match arg.as_str() {
             "--screenshot" => {
                 args.screenshot = Some(it.next().context("--screenshot needs a file path")?);
+            }
+            "--dump-field" => {
+                args.screenshot = Some(it.next().context("--dump-field needs a file path")?);
+                args.field = true;
+                // Square by default: the analysis compares the two axes of
+                // the field against each other, so a 16:9 patch would make
+                // one of them shorter for no reason.
+                if args.size == DEFAULT_SIZE {
+                    args.size = (1024, 1024);
+                }
             }
             "--size" => {
                 let v = it.next().context("--size needs WxH, e.g. 1920x1080")?;
@@ -132,6 +145,8 @@ fn parse_args() -> Result<Args> {
                      --size <WxH>                    render size in pixels (default 1920x1080)\n\
                      --fullscreen                    open borderless at the monitor's resolution\n\
                      --screenshot <out.png>          render one frame headlessly to a PNG\n\
+                     --dump-field <out.png>          top-down density field, linear, for analysis\n\
+                                                     (R full, G base only, B raw noise; 1024^2)\n\
                      --time <seconds>                animation time for the screenshot\n\
                      --sun <radians>                 sun elevation (0 = horizon, 1.57 = zenith)\n\
                      --yaw, --pitch <radians>        camera direction for the screenshot\n\
@@ -204,6 +219,7 @@ fn main() -> Result<()> {
                 pitch: args.pitch,
                 params: args.params,
                 defines: args.defines,
+                field: args.field,
             },
         ),
         None => app::App::run(

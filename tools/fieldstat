@@ -1,0 +1,219 @@
+#!/usr/bin/env -S uv run --script
+# usage: tools/fieldstat <field.png>... [--channel full|base|raw] [--tiles N] [--json]
+# desc: Measure how repetitive a dumped cloud density field is
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["numpy>=2.0", "pillow>=10.0"]
+# ///
+"""Three numbers for "does this field repeat".
+
+`--dump-field` writes a top-down slice of the real density field, FIELD_TILES
+base-texture tiles across. This scores it.
+
+tile_lock   0 = no repeat at the texture period, 1 = perfectly tiling.
+            A field that repeats every image/T pixels has a Fourier transform
+            that is *exactly zero* except at frequencies which are multiples
+            of T cycles per image. So the share of spectral energy sitting on
+            that sublattice is a direct, sharp test for the texture's repeat,
+            with no threshold to tune. Rescaled so that a field with no repeat
+            scores 0 rather than the 1/T^2 it gets by coincidence.
+
+acorr_peak  The largest normalised autocorrelation at any lag beyond the
+            cloud features themselves. This is the perceptual version: it
+            catches a repeat at *any* period, including one the tile lattice
+            would miss, and it is what the eye is reacting to when a sky looks
+            stamped out. 1.0 means some shift reproduces the field exactly.
+
+axis_bias   How much more spectral energy lies along the cardinal axes than
+            the average direction. Value noise is built on a cubic lattice and
+            leaks that lattice's axes into the field; a well-behaved field is
+            close to 1.0, and the streaks of a lattice artefact push it up.
+
+Zero-padding matters: autocorrelation computed by FFT on an unpadded image
+wraps around, which hands a tiling field a perfect score at the image width
+whether or not it deserves one. Everything here pads to 2N and divides by the
+true per-lag overlap count.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+CHANNELS = {"full": 0, "base": 1, "raw": 2}
+DEFAULT_TILES = 8.0  # must match FIELD_TILES in shaders/clouds.wgsl
+
+
+def load(path: Path, channel: str) -> np.ndarray:
+    img = Image.open(path)
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    a = np.asarray(img, dtype=np.float64)[:, :, CHANNELS[channel]] / 255.0
+    if a.shape[0] != a.shape[1]:
+        raise ValueError(f"{path}: expected a square dump, got {a.shape[1]}x{a.shape[0]}")
+    return a
+
+
+def tile_lock(field: np.ndarray, tiles: float) -> tuple[float, float]:
+    """Share of spectral energy on the repeat sublattice, raw and rescaled."""
+    n = field.shape[0]
+    t = int(round(tiles))
+    if abs(tiles - t) > 1e-6 or n % t:
+        raise ValueError(f"--tiles {tiles} must be a whole number dividing {n}")
+
+    spectrum = np.abs(np.fft.fft2(field - field.mean())) ** 2
+    total = spectrum.sum()
+    if total <= 0:
+        return 0.0, 0.0  # a constant field: no structure to repeat
+
+    # Frequencies that are multiples of `t` cycles per image, DC excluded.
+    on_lattice = spectrum[::t, ::t].sum() - spectrum[0, 0]
+    raw = on_lattice / total
+
+    # A field with no repeat still lands 1/t^2 of its energy here by chance,
+    # because that is the share of bins the sublattice covers. Subtract it so
+    # 0 means "no more than chance".
+    chance = 1.0 / (t * t)
+    return float(raw), float(max(0.0, (raw - chance) / (1.0 - chance)))
+
+
+def autocorr_peak(field: np.ndarray, min_lag: int) -> tuple[float, tuple[int, int]]:
+    """Largest normalised autocorrelation at a lag of at least `min_lag` px."""
+    n = field.shape[0]
+    x = field - field.mean()
+    if not np.any(x):
+        return 0.0, (0, 0)
+
+    pad = 2 * n
+    f = np.fft.fft2(x, s=(pad, pad))
+    corr = np.real(np.fft.ifft2(f * np.conj(f)))
+
+    # Overlap count per lag, so an estimate at a long lag is not penalised
+    # simply for having fewer pixels behind it.
+    ones = np.ones_like(x)
+    g = np.fft.fft2(ones, s=(pad, pad))
+    overlap = np.real(np.fft.ifft2(g * np.conj(g)))
+
+    # Drop lags supported by less than a quarter of the image: past that the
+    # estimate is built on so few pixels that it invents peaks of its own.
+    valid = overlap > 0.25 * n * n
+    norm = np.zeros_like(corr)
+    norm[valid] = corr[valid] / overlap[valid]
+    norm /= norm[0, 0]
+
+    # Lag magnitude for every bin, taking the shorter way round the wrap.
+    axis = np.fft.fftfreq(pad, d=1.0 / pad).astype(int)
+    dy, dx = np.meshgrid(axis, axis, indexing="ij")
+    far = (dy * dy + dx * dx) >= min_lag * min_lag
+
+    mask = far & valid
+    if not mask.any():
+        return 0.0, (0, 0)
+    flat = np.where(mask, norm, -np.inf)
+    idx = np.unravel_index(np.argmax(flat), flat.shape)
+    return float(flat[idx]), (int(axis[idx[0]]), int(axis[idx[1]]))
+
+
+def axis_bias(field: np.ndarray) -> float:
+    """Cardinal-axis spectral energy over the all-direction average."""
+    n = field.shape[0]
+    spectrum = np.abs(np.fft.fft2(field - field.mean())) ** 2
+    spectrum[0, 0] = 0.0
+    freq = np.fft.fftfreq(n) * n
+    ky, kx = np.meshgrid(freq, freq, indexing="ij")
+    radius = np.hypot(ky, kx)
+
+    # Ignore the lowest frequencies: with only a handful of bins in the ring,
+    # "direction" is not yet meaningful.
+    band = radius >= 4
+    if not band.any() or spectrum[band].sum() <= 0:
+        return 1.0
+
+    angle = np.degrees(np.arctan2(np.abs(ky), np.abs(kx)))  # 0..90, folded
+    near_axis = band & ((angle <= 10) | (angle >= 80))
+    if not near_axis.any():
+        return 1.0
+
+    on = spectrum[near_axis].mean()
+    everywhere = spectrum[band].mean()
+    return float(on / everywhere) if everywhere > 0 else 1.0
+
+
+def measure(path: Path, channel: str, tiles: float) -> dict:
+    field = load(path, channel)
+    n = field.shape[0]
+    # One cloud feature is a quarter of a tile (TILE_SCALE = 4). Start looking
+    # for repeats beyond two of them, which is past the field's own blobs.
+    min_lag = max(4, int(round(2 * n / (tiles * 4))))
+    raw, locked = tile_lock(field, tiles)
+    peak, lag = autocorr_peak(field, min_lag)
+    return {
+        "file": str(path),
+        "channel": channel,
+        "size": n,
+        "tiles": tiles,
+        "tile_lock": round(locked, 4),
+        "tile_lock_raw": round(raw, 4),
+        "acorr_peak": round(peak, 4),
+        "acorr_lag_px": list(lag),
+        "acorr_min_lag_px": min_lag,
+        "axis_bias": round(axis_bias(field), 3),
+        "mean": round(float(field.mean()), 4),
+        "std": round(float(field.std()), 4),
+    }
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args or "-h" in args or "--help" in args:
+        print(__doc__.strip() + "\n\nusage: tools/fieldstat <field.png>... "
+              "[--channel full|base|raw] [--tiles N] [--json]")
+        return 0 if args else 2
+
+    channel, tiles, as_json, paths = "base", DEFAULT_TILES, False, []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--channel":
+            i += 1
+            channel = args[i]
+            if channel not in CHANNELS:
+                print(f"fieldstat: --channel must be one of {', '.join(CHANNELS)}", file=sys.stderr)
+                return 2
+        elif a == "--tiles":
+            i += 1
+            tiles = float(args[i])
+        elif a == "--json":
+            as_json = True
+        elif a.startswith("-"):
+            print(f"fieldstat: unknown option {a}", file=sys.stderr)
+            return 2
+        else:
+            paths.append(Path(a))
+        i += 1
+
+    rows, failed = [], 0
+    for p in paths:
+        try:
+            rows.append(measure(p, channel, tiles))
+        except (OSError, ValueError) as e:
+            failed += 1
+            print(f"fieldstat: {p}: {e}", file=sys.stderr)
+
+    if as_json:
+        print(json.dumps(rows, indent=2))
+    elif rows:
+        print(f"{'file':<44} {'tile_lock':>9} {'acorr':>7} {'lag':>12} {'axis':>6} {'std':>6}")
+        for r in rows:
+            lag = f"{r['acorr_lag_px'][1]},{r['acorr_lag_px'][0]}"
+            print(
+                f"{Path(r['file']).name:<44} {r['tile_lock']:>9.3f} {r['acorr_peak']:>7.3f} "
+                f"{lag:>12} {r['axis_bias']:>6.2f} {r['std']:>6.3f}"
+            )
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
