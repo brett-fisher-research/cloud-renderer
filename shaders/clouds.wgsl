@@ -85,13 +85,13 @@ const WIND_SHEAR: f32 = 500.0;
 // shorter than STEP_MIN. Growing steps are what make a 200 km view affordable:
 // a cloud twice as far away is half the size on screen and needs half the
 // samples.
-const STEP_MIN: f32 = 28.0;
-const STEP_GROWTH: f32 = 0.004;
+const STEP_MIN: f32 = 20.0;
+const STEP_GROWTH: f32 = 0.003;
 // Strides through clear air are this many times longer than steps in cloud.
 const STEP_COARSE: f32 = 2.0;
 // Consecutive empty samples before giving up on short steps.
 const FINE_PATIENCE: i32 = 3;
-const MAX_STEPS: i32 = 220;
+const MAX_STEPS: i32 = 280;
 // Where the weather map says the whole column is clear, steps are this much
 // longer.
 const EMPTY_STEP_SCALE: f32 = 2.0;
@@ -113,7 +113,7 @@ const LIGHT_STEP_SIZE: f32 = 55.0;   // metres, length of the first step
 const LIGHT_STEP_GROWTH: f32 = 1.6;  // each step is this much longer
 // How far each shadow sample is randomly shifted within its step, 0..1.
 // Trades terraces in the shading (0) for fine grain (1).
-const LIGHT_JITTER: f32 = 0.25;
+const LIGHT_JITTER: f32 = 0.0;
 
 // Multiple scattering, approximated. Light in a cloud bounces many times;
 // simulating one bounce only gives clouds that are black inside. Each
@@ -178,7 +178,6 @@ const MIE_G: f32 = 0.80;
 const OZONE: vec3<f32> = vec3<f32>(0.650e-3, 1.881e-3, 0.085e-3);
 
 const PI: f32 = 3.14159265;
-const DEBUG: i32 = 0;
 
 // ===========================================================================
 //  Inputs
@@ -803,7 +802,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let b = r0 * mu;
 
     var col: vec3<f32>;
-    var disc_dbg = 0.0;
 
     // Does the ray hit the ground? Same quadratic as `sphere_exit`, but for
     // a sphere we are outside of, and we want the near root.
@@ -828,7 +826,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let sun_radius = 0.00465;
         let pixel_angle = 2.0 * u.fov_tan / u.resolution.y;
         let disc_cover = SUN_DISC * saturate((sun_radius - sun_angle) / pixel_angle + 0.5);
-        disc_dbg = disc_cover;
         if (disc_cover > 0.0) {
             let edge = saturate(sun_angle / sun_radius);
             let limb = 1.0 - 0.6 * (1.0 - sqrt(1.0 - edge * edge));
@@ -850,10 +847,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    if (DEBUG == 1) { return vec4<f32>(sun_transmittance(r0, mu), 1.0); }
-    if (DEBUG == 2) { return vec4<f32>(textureSampleLevel(transmittance_table, table_sampler, in.ndc * 0.5 + 0.5, 0.0).rgb, 1.0); }
-    if (DEBUG == 3) { return vec4<f32>(textureSampleLevel(multiscatter_table, table_sampler, in.ndc * 0.5 + 0.5, 0.0).rgb * 10.0, 1.0); }
-    if (DEBUG == 4) { return vec4<f32>(vec3<f32>(disc_dbg), 1.0); }
     // Exposure scales linear radiance like a camera's shutter; the tone map
     // then compresses the bright end.
     // Glare: light from the sun spreading inside the lens. It lies over the

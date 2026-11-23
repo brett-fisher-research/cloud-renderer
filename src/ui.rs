@@ -106,8 +106,8 @@ impl Ui {
                             .fixed_decimals(0),
                     )
                     .on_hover_text(
-                        "Size of the largest noise features: how big the clouds are.\n\
-                         Small = busy popcorn, large = continental masses.",
+                        "How wide a typical cloud is.\n\
+                         Small = popcorn, large = towering masses.",
                     );
 
                     ui.add(
@@ -120,8 +120,8 @@ impl Ui {
                     )
                     .on_hover_text(
                         "Self-shadowing strength.\n\
-                         Low fakes the light that bounces around inside a real cloud, which \
-                         single scattering misses; high leaves a flat grey mass.",
+                         Low lets sunlight soak through so the clouds glow; \
+                         high gives dark, heavy undersides.",
                     );
 
                     ui.add(

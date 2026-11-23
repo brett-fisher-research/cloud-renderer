@@ -1,8 +1,8 @@
 # cloud-renderer
 
 A small real-time volumetric cloud renderer in Rust, built as a graphics-programming learning
-project. A window shows a sky with a layer of puffy, sunlit, slowly drifting clouds you can look
-around in.
+project. A window shows a physically based sky over a flat plain, with a layer of sunlit cumulus
+drifting across it, casting shadows on the ground.
 
 Brett is an experienced web developer and new to graphics programming. Introduce new graphics
 concepts briefly when they first appear, in replies and in code comments.
@@ -14,195 +14,119 @@ lives in one shader you can edit while the program runs.
 
 ### CPU side (Rust)
 
-Opens a window, draws one full-screen triangle, and writes a uniform buffer each frame. It does no
-geometry, no scene graph and no per-pixel work.
+Opens a window, bakes five textures once at startup, draws one full-screen triangle, and writes
+two small uniform buffers each frame. It does no geometry, no scene graph and no per-pixel work.
 
 - `src/main.rs` — argument parsing, picks windowed or headless mode.
 - `src/gpu.rs` — wgpu instance, adapter, device and queue. Vulkan-only; logs every adapter it sees.
-- `src/noise.rs` — bakes the tiling 3D noise textures the shader samples, once at startup:
-  two value-noise fields and one Worley field.
+- `src/noise.rs` — bakes the three tiling noise textures: cloud shape, edge detail, weather map.
+- `src/atmosphere.rs` — bakes the two sky tables: transmittance and multiple scattering.
 - `src/camera.rs` — look-around camera and the `Uniforms` struct sent to the GPU.
-- `src/params.rs` — the four live-tunable cloud dials, their slider ranges, and the
-  `Algorithm` enum naming the five density fields.
-- `src/ui.rs` — the egui panel the dials and the algorithm picker are drawn on.
-- `src/renderer.rs` — pipeline, uniform buffer, and shader compilation with hot-reload.
+- `src/params.rs` — the four live dials and their slider ranges.
+- `src/ui.rs` — the egui panel the dials are drawn on.
+- `src/renderer.rs` — pipeline, bindings, and shader compilation with hot-reload.
 - `src/app.rs` — winit event loop, mouse input, FPS counter.
-- `src/screenshot.rs` — headless render of one frame to a PNG.
-- `src/watch.rs` — filesystem watching for the shader.
+- `src/screenshot.rs`, `src/bench.rs` — headless still and headless GPU-timed benchmark.
+- `src/defines.rs`, `src/watch.rs` — `--def` constant overrides and shader file watching.
 
 ### Shader side (WGSL)
 
-`shaders/clouds.wgsl` holds everything visual. Its tunable constants sit in one block at the top.
-Four of them — coverage, noise feature size, shadow strength and exposure — are not constants but
-live dials in a second uniform buffer (`struct Params`, `@group(0) @binding(1)`), driven by the
-on-screen panel, along with `algorithm`, which picks one of five density fields. Everything else
-is still a `const` and changes on save via hot-reload. The fragment shader, per pixel:
+`shaders/clouds.wgsl` holds everything visual. Every tunable is a named `const` in one block at
+the top and changes on save. Four values are live dials instead, in `struct Params`: coverage,
+feature size, shadow strength and exposure.
 
-1. Builds a view ray from the camera basis in the uniforms.
-2. Colours the sky: a zenith-to-horizon gradient, a warm low-sun tint, and a halo around the sun.
-   There is deliberately no sun disc; a hard-edged circle read as pasted on over the soft clouds.
-3. Intersects the ray with a horizontal slab between `CLOUD_BOTTOM` and `CLOUD_TOP`.
-4. Raymarches that slab in `PRIMARY_STEPS` steps, asking the selected algorithm for a density at
-   each sample — see *The five algorithms* below — scrolled over time by `WIND`. The mip level
-   comes from the step length, not from screen space, which is what keeps distant cloud from
-   fizzing. For the field-based algorithms the lookup point is warped and the base texture is
-   read twice at incommensurate scales, so the texture's repeat falls outside the view — see
-   *Breaking the repeat* below.
-5. At each sample, marches `LIGHT_STEPS` towards the sun and applies Beer's law to find how much
-   sunlight arrives, then weights it by a two-lobe Henyey-Greenstein phase function and adds
-   ambient skylight.
-6. Fades each sample towards the sky colour for that ray with distance (`AERIAL_DISTANCE`),
-   which is what makes distant clouds recede instead of piling into a stripe at the horizon.
-7. Composites the cloud over the sky using accumulated transmittance, then tone maps.
+Per pixel, the fragment shader:
+
+1. Builds a view ray from the camera basis.
+2. If the ray hits the ground: shades it with sun, skylight and the shadow of the clouds above.
+3. Otherwise marches the cloud layer, a spherical shell between `CLOUD_BOTTOM` and `CLOUD_TOP`
+   around a round planet. The shell curves down behind the horizon, so there is no vanishing
+   point for the layer to pile into.
+4. Marches the atmosphere twice, in front of the cloud and behind it. The near part fades distant
+   cloud into haze (aerial perspective); the far part is the sky seen through the gaps.
+5. Composites, adds lens glare around the sun, exposes, tone maps (ACES) and dithers.
+
+The vertex shader runs three times a frame, not four million, so it computes what is the same for
+every pixel: mean sky colour (ambient light), the ground's bounce light, auto exposure, and how
+much of the sun the camera can see. These reach the fragment shader as `flat` varyings.
+
+### The cloud model
+
+One model, in the style of Guerrilla's Nubis (Horizon Zero Dawn). `cloud_density` answers "how
+much cloud is at this point" from three textures:
+
+- Weather map (2D, read top-down, twice). The first read says where clouds are and how tall. The
+  second, zoomed out and rotated, raises or lowers coverage by region, so clouds gather in groups
+  and no two copies of the tile look alike.
+- Shape (3D Perlin-Worley). Thresholded against a height profile that rises sharply at the base
+  and tapers towards the top: flat bottoms, rounded lumpy summits.
+- Detail (3D Worley). Pushes the surface in and out for the cauliflower texture. Read a second
+  time at a finer scale near the camera only.
+
+The march takes long strides through clear air and backs up to short steps on entering cloud.
+Both lengths grow with distance, and the texture mip follows the step length, which is what keeps
+distant cloud from shimmering.
+
+Lighting at each cloud sample:
+
+- A light march of `LIGHT_STEPS` samples towards the sun gives the optical depth. It sees a
+  softer cloud edge than the view march (`SHADOW_SOFTNESS`) so shadows vary smoothly.
+- Multiple scattering is approximated by `MS_OCTAVES` octaves, each dimmer, deeper-reaching and
+  less directional, plus a slow diffuse glow (`DIFFUSE_GAIN`).
+- Later octaves and the glow use the cloud depth overhead (from the weather map) instead of the
+  exact path to the sun. With the sun path alone, every bump cast a streak through the cloud.
+- Ambient light is the mean sky from above and ground bounce from below.
+
+### The sky
+
+Hillaire's 2020 atmosphere model. `src/atmosphere.rs` bakes a transmittance table (how much
+sunlight reaches a point at a given altitude and sun angle) and a multiple-scattering table. The
+shader marches Rayleigh, Mie and ozone along the view ray with one lookup into each per step.
+Sunset reddening, twilight, and the planet's shadow all fall out of it. The sun's colour on the
+clouds comes from the same transmittance table.
 
 ### Conventions worth knowing
 
-- Units are metres and seconds. The camera sits at `CAMERA_HEIGHT` above a flat ground plane.
-- Colours in the shader are linear radiance and may exceed 1.0. Tone mapping and sRGB encoding
-  happen at the very end, so constants look darker than the image they produce.
-- `Uniforms` in `src/camera.rs` and `struct Uniforms` in the shader must match exactly, including
-  the padding floats after each `vec3`. A mismatch gives silent garbage, not an error. The same
-  goes for `Params` in `src/params.rs`. It holds plain 4-byte scalars so there is no alignment
-  to get wrong, only a size that has to stay a multiple of 16: four dials filled the first row,
-  `algorithm` opened a second, and `_pad[3]` is the rest of it. Three more dials are free; the
-  fourth costs another row on both sides.
-- The params uniform is named `dials` in the shader, not `p`, because `cloud_density` already uses
-  `p` for the sample point.
-- `@group(0)` carries the two uniform buffers at bindings 0 and 1 and the noise at 2, 3, 4 and 5:
-  base texture, detail texture, shared sampler, Worley texture. The sampler's address mode is
-  `Repeat`, which is what lets one cube of noise cover the sky.
-- The *shape* of the noise field — octave count and the amplitude of each — lives in
-  `src/noise.rs`, because it is baked before the first frame. Changing it needs a rebuild, not a
-  save. How the field is *used* (`TILE_SCALE`, `DETAIL_SCALE`, `DETAIL_STRENGTH`) is still shader
-  constants and still hot-reloads.
-
-### The five algorithms
-
-The complaint that started this: at a near-horizon pitch the sky was long streaks converging on a
-vanishing point, and cloud covered all of it. Two separate causes, and the fix for each is a
-different density field rather than a different dial, so the field became a live choice:
-`dials.algorithm`, a dropdown at the top of the panel and `--algorithm NAME` headlessly.
-
-Every mode marches the same slab with the same lighting, aerial perspective and tone mapping.
-Only the function answering *how much cloud is at this point* changes.
-
-| mode | field | worst ms | acorr | axis |
-| --- | --- | --- | --- | --- |
-| `fbm` | thresholded fBm, one connected field everywhere | 11.34 | 0.534 | 0.99 |
-| `islands` | fBm times a coarse gate: masses with sky between | 12.02 | 0.386 | 1.19 |
-| `puffs` | hash-placed blobs on a grid, eroded by noise | **10.09** | **0.374** | 0.88 |
-| `billow` | Perlin-Worley: a cellular field remapped into the fBm | 11.95 | 0.534 | 0.99 |
-| `cumulus` | billow inside the islands gate | 12.62 | 0.386 | 1.19 |
-
-Worst scene is `overcast-up` for all five, at 2560x1440 against the 13 ms budget. All fit.
-
-**What each one answers.** The streaking is not a noise defect: a ray a few degrees above the
-horizon crosses tens of kilometres of a 1500 m slab, so it integrates one long tube of the same
-layer and neighbouring pixels integrate almost the same tube. Any field that fills the sky
-smears that way. `islands` and `cumulus` attack it by making most of the sky empty, so a shallow
-ray spends most of its length in clear air. `puffs` removes it outright, because there is no
-field to smear — a ray either hits a blob or does not.
-
-**`puffs` is the answer to "simple clouds for a game".** Discrete cumulus with blue sky between
-them, the cheapest worst case of the five, and a `tile_lock` of exactly 0.000: the shape has no
-period anywhere in it, only the erosion read does. Its coverage dial is the most literal yet —
-the value is the fraction of grid cells holding a cloud — and it saturates near 0.65, which is
-honest, because a sky of separate clouds cannot become overcast.
-
-**Keeping the dials comparable cost more thought than the fields did.** Flipping modes is only
-useful if `coverage 0.5` means the same sky in each, and by default it did not: measured as the
-fraction of a field dump above zero, `fbm` gave 0.53, `billow` 0.78 and `puffs` 0.32. Each mode
-now carries a measured calibration — `BILLOW_MEAN`/`BILLOW_GAIN` put the remapped field back on
-mode 0's mean and spread, `ISLAND_GAMMA` splits the dial between two tests in series, and
-`PUFF_COVER_GAIN` accounts for a round blob not filling its square cell. All five now land
-within 0.5 ± 0.05.
-
-**Two things the harness caught that the eye did not.**
-
-- `puffs` scored `axis_bias` 2.53 against the fBm field's 0.99: its square cell grid was leaking
-  into the field exactly as the value-noise lattice once did. Rotating the grid 31.7 degrees
-  against the world axes took it to 0.88 and left `acorr_peak` at 0.374 — which is the honest
-  reading of what the rotation does. It does not destroy the lattice, it stops the lattice being
-  aligned with the wind and the cardinal directions a player looks along. It also measured 0.85 ms
-  *faster* on the worst scene and slower on two mid scenes; the cause is not established.
-- The notebook's `base` channel means something different for `billow` and `cumulus`. That
-  channel is the density with `detail` off, and `BILLOW_IN_SHADOW` is false, so the Worley read
-  is off there too: those rows score the plain fBm field. The `raw` channel is the honest one
-  for those modes.
-
-**Costs, and what paid them down.** The first working versions were 21.8, 16.0 and 14.6 ms —
-`puffs`, `billow` and `islands` all over budget. Three changes, each the same idea as something
-already in the renderer:
-
-- `puffs` searches four cells, not nine. The constants are chosen so a blob reaches at most 0.91
-  cells from its own centre while the fifth-nearest cell centre is at least 1.0 away, so the five
-  cells it skips provably cannot contribute. 21.8 ms to 11.1.
-- `billow` skips its Worley read in the shadow march (`BILLOW_IN_SHADOW`), the same bargain the
-  detail texture already strikes: a shadow is an integral along a line and the bulges average out
-  of it. 16.0 ms to 11.9, no visible difference.
-- `islands` computes its gate once per view sample and hands it to the shadow march, the same
-  bargain as `WARP_SHARED_SHADOW`: the gate varies over tens of kilometres and the march walks
-  one. 14.6 ms to 12.0.
-
-**What is still wrong with them.** `islands` and `cumulus` reduce the horizon streaking but do
-not remove it — where the gate is open the field is still a sheet, and a near-horizon view is
-mostly that. `puffs` clouds are uniform in size and read as pebbly near the horizon, and they
-have no anvil or flat base of their own beyond what the slab imposes.
-
-### Breaking the repeat
-
-The base texture tiles every `TILE_SCALE` feature sizes — 10.4 km at the default dial, against a
-50 km `MAX_DISTANCE`. Left alone, a view holds five copies of the same sky in each direction, and
-in perspective a repeating lattice on a horizontal plane projects to lines converging on a
-vanishing point: a radial moiré at the horizon. Two levers push the repeat past the view.
-
-- **`WARP_GRADIENT`** displaces the lookup point analytically, for a few transcendentals and no
-  bandwidth. Its parameter is a bound on the warp's *Jacobian*, not an amplitude, because
-  amplitude alone says nothing about folding — above 1.0 the domain folds back through itself and
-  tears a hard crease across a cloud. A long wavelength beats a short one: decorrelation goes as
-  `L*sin(pi*T/L)`, so 1.618 tiles spends 48% of the gradient budget usefully where 9.87 spends 93%.
-- **`MIX_AMOUNT`** blends a second read of the same texture at an irrational relative scale, for
-  one extra fetch. The warp alone is not enough and cannot be: a smooth map acts locally like a
-  constant shift, so it relabels periodicity to another lag rather than destroying it.
-
-The warp also fixed the cubic value-noise lattice leaking its axes into the field, which was a
-second defect nobody had noticed: `axis_bias` 3.21 to 1.01.
+- Units are metres and seconds for clouds, kilometres for the atmosphere. The camera sits at
+  `CAMERA_HEIGHT` (150 m, a hilltop) so the ground reaches a horizon 44 km away and fades into haze.
+- Colours are linear radiance with the sun's illuminance as 1.0. Tone mapping and sRGB encoding
+  happen at the very end.
+- `Uniforms` in `src/camera.rs` and in the shader must match exactly, including the padding float
+  after each `vec3`. A mismatch gives silent garbage. `Params` is four plain floats, exactly one
+  16-byte row; a fifth dial needs three padding floats beside it on both sides.
+- The atmosphere constants are duplicated in `src/atmosphere.rs` and at the top of the shader and
+  must match, because the tables are baked from one and read by the other.
+- Bindings in `@group(0)`: uniforms 0 and 1, shape 2, detail 3, weather 4, transmittance 5,
+  multiple scattering 6, repeating sampler 7, clamping sampler 8.
+- The weather map is half-float. As 8-bit, its thresholded edges followed quantisation steps.
+- Sphere intersections and altitudes use rearranged formulas (`sphere_exit`) that never subtract
+  two planet-sized numbers; the textbook forms lose all precision in 32-bit floats.
+- Noise shape lives in `src/noise.rs` and needs a rebuild to change. How it is used (`*_TILE`,
+  `DETAIL_STRENGTH`, `EDGE_WIDTH`) is shader constants and hot-reloads.
 
 ## Measuring
 
-Three instruments, all headless, so a change can be judged without anyone at the keyboard.
+Everything runs headless, so a change can be judged without anyone at the keyboard.
 
-- `--def NAME=VALUE` rewrites any `const` in `clouds.wgsl` between reading it and compiling it.
-  The file on disk is untouched, the override survives hot-reload, and the bench line prints it.
-  A define matching no declaration is a hard error: silently measuring the default would be a
-  worse failure than a crash.
-- `--dump-field out.png` renders the density field top-down through the same bindings as the real
-  renderer, to a *linear* target. R is full density, G base only, B the raw field before the
-  coverage threshold. Sized in tile units, so dumps at different feature sizes compare directly.
-- `tools/lab run <name> [--algo NAME] [--def K=V]...` runs the whole scene matrix, scores it and
-  appends a row per scene to `docs/experiments.jsonl`, which is only ever appended to.
-  `tools/lab noise-floor` says how much the benchmark wobbles; `tools/lab report` prints the
-  frontier so far.
+- `tools/shots <name> [flags]` renders twelve standard views and tiles them into
+  `out/<name>.png`. Look at this after any change to the image.
+- `tools/perf [flags]` prints GPU milliseconds for fourteen scenes at 2560x1440.
+- `tools/lab run <name> [--def K=V]...` runs the scene matrix, scores it and appends a row per
+  scene to `docs/experiments.jsonl`. `tools/lab report` prints the frontier so far.
+- `--def NAME=VALUE` overrides any shader `const` for one run. A name matching nothing is a hard
+  error. All three tools pass it through.
+- `--dump-field out.png` renders the density top-down to a linear target: R is density a third of
+  the way up the layer, G the same without detail, B the weather map's cover signal.
 
-`tools/fieldstat` scores a field dump three ways. `tile_lock` is the share of spectral energy on
-the repeat sublattice — a field repeating every `image/T` pixels has a transform that is exactly
-zero off it, so this needs no threshold. `acorr_peak` is the largest normalised autocorrelation
-past the field's own feature size, which catches a repeat at any period; `acorr_view` restricts it
-to lags where both copies could appear in one frame. `axis_bias` is cardinal-axis spectral energy
-over the all-direction average, which is where a cubic lattice shows up.
-
-`tools/imgstat` guards the picture: a repetition fix can always cheat by blurring. `contrast`,
-`detail` (RMS of the image minus a 2 px blur of itself) and `slope`, plus SSIM against `--ref`.
+`tools/fieldstat` scores a field dump for repetition (`tile_lock`, `acorr_peak`, `axis_bias`) and
+`tools/imgstat` scores a render for contrast and detail. Current field scores: `acorr_peak` 0.40
+against a floor of 0.26, `tile_lock` 0.15, `axis_bias` 1.41.
 
 Two cautions, both learned the hard way:
 
-- **SSIM is only meaningful when the two images are meant to depict the same thing**, such as more
-  march steps against fewer. Scoring a new noise field against a render of the old one measures
-  how much the field changed, which is the thing being asked for.
-- **Every metric needs a control with a known answer.** `fieldstat` was validated against white
-  noise, a tiled block and axis-aligned stripes before being believed. The floor for
-  `acorr_peak` is 0.26, measured on a synthetic field with the same radial spectrum and random
-  phases — not 0, because a field with large-scale structure correlates with itself.
+- SSIM is only meaningful when the two images are meant to depict the same thing, such as more
+  march steps against fewer.
+- Every metric needs a control with a known answer before it is believed.
 
 ## Running it
 
@@ -212,171 +136,70 @@ cargo run --release -- --size 2560x1440    # any size, in real pixels
 cargo run --release -- --fullscreen        # borderless, at the monitor's resolution
 cargo run --release -- --no-vsync          # uncapped, for benchmarking
 cargo run --release -- --bench             # headless GPU-timed benchmark, no window
-cargo run --release -- --def LIGHT_STEPS=16 --bench    # override any shader const
-cargo run --release -- --algorithm puffs               # pick a density algorithm
-cargo run --release -- --dump-field out/field.png      # density field, for analysis
+cargo run --release -- --def LIGHT_STEPS=12 --bench    # override any shader const
+cargo run --release -- --screenshot out/shot.png --time 120 --sun 0.9 --yaw 0.6 --pitch 0.3
 ```
 
-The window starts at 1920x1080 and can be dragged to any size; the surface is reconfigured on
-resize, so the shader always fills whatever the window currently is.
+Controls: drag to look around, shift-drag to swing the sun around the compass, scroll to raise or
+lower the sun (it can set), Esc to quit. The title bar shows frame rate, resolution and sun
+elevation.
 
-Controls: drag the mouse to look around, shift-drag to swing the sun around the compass, scroll to
-raise or lower the sun, Esc to quit. The title bar shows frame rate, resolution and sun elevation;
-frame rate is also logged every two seconds.
+The panel in the top-left has the four dials:
 
-A panel in the top-left picks the **algorithm** — `fbm`, `islands`, `puffs`, `billow` or
-`cumulus`, described in *The five algorithms* above — and has sliders for the four dials that
-change the look the most: **coverage** (how much of the sky is cloud, now close to literal, and
-calibrated so it means the same in every algorithm — 0.45 is about 45% of the layer), **feature
-size** (how big the clouds are, 300 m to 10 km), **shadow** (how strongly
-they shadow themselves — low fakes the multiple scattering that keeps real clouds bright) and
-**exposure** (overall brightness). The panel swallows mouse input while the pointer is over it, so
-dragging a slider does not also spin the camera.
+- coverage — how much of the sky is cloud, 0 clear to 1 overcast.
+- feature size — how wide a typical cloud is, 500 m to 6 km.
+- shadow — self-shadowing strength; low glows, high gives heavy dark undersides.
+- exposure — brightness, on top of the automatic exposure that follows the sun down.
+
+Each dial has a flag (`--coverage`, `--feature-size`, `--shadow`, `--exposure`), and `--time`,
+`--sun`, `--yaw`, `--pitch` set the scene, so any look can be reproduced headlessly. `--sun`,
+`--yaw` and `--pitch` are radians. `out/` is gitignored.
 
 Edit `shaders/clouds.wgsl` while it runs and the change appears on save. If the shader fails to
 compile, the error prints with the offending line and the last working version keeps rendering.
 
-### Screenshots
-
-Headless mode renders one frame at 1920x1080 and exits, with no window. `--size` applies here
-too, so `--size 3840x2160` gives a 4K still of a scene that would not run at that size. Use it to
-check visual changes without needing someone at the keyboard.
-
-```sh
-cargo run --release -- --screenshot out/shot.png
-cargo run --release -- --screenshot out/shot.png --time 120 --sun 0.9 --yaw 0.6 --pitch 0.3
-```
-
-`--time` is animation seconds, and `--sun`, `--yaw` and `--pitch` are radians. The dials have
-flags too — `--algorithm`, `--coverage`, `--feature-size`, `--shadow`, `--exposure` — so a look
-found by dragging sliders can be reproduced headlessly. `out/*.png` is gitignored.
-
-After building anything that changes the image, render a screenshot, look at it, and fix what
-looks wrong before reporting the work as done. When something looks off, measure it before calling
-it a bug: a disc that looks elliptical off-axis, for example, is correct rectilinear projection.
+After building anything that changes the image, run `tools/shots`, look at the sheet, and fix
+what looks wrong before reporting the work as done.
 
 ## Performance
 
-`--bench` is the measuring instrument: a headless mode that renders the cloud pass over and
-over into an offscreen texture and times it with GPU timestamp queries, so the number is the
-GPU's own clock around that one pass, with no window, vsync, compositor or egui in it.
-
-```sh
-cargo run --release -- --bench                              # 48 frames at 1920x1080
-cargo run --release -- --bench --size 2560x1440 --coverage 0.85 --pitch 0.55 --label worst
-```
-
-It takes the same scene flags as `--screenshot`, so a scenario can be pinned down exactly and
-re-measured after a change. It reports median, min, p95 and mean; the median is the one to
-quote. Its 1280x720 reading agrees with the hand-timed `--no-vsync` numbers below to within a
-rounding error, which is what first validated it.
-
-Measured on an AMD RX 7800 XT (RADV, Mesa 24.2.8). The target is **60 fps at 2560x1440**, so the
-cloud pass is budgeted at 13 ms, leaving the rest of the 16.7 ms for vsync, egui and drift.
-
-The benchmark is far tighter than it needs to be: ten identical runs give a standard deviation of
-0.008 ms, 0.12%. **An effect is only real above 0.016 ms, or 0.25%.** Anything smaller is noise.
-
-Current, at 2560x1440, worst scene first:
+The target is 60 fps at 2560x1440, so the cloud pass is budgeted at 13 ms. Measured on an AMD
+RX 7800 XT (RADV, Mesa 24.2.8) with `--bench`, which times the pass with GPU timestamp queries.
+An effect is only real above 0.016 ms.
 
 | scene | ms | | scene | ms |
 | --- | --- | --- | --- | --- |
-| overcast-up (coverage 0.85, pitch 0.55) | 11.4 | | small-features (300 m) | 8.8 |
-| backlit (sun 0.08) | 9.9 | | default | 5.2 |
-| reported (coverage 0.77) | 8.9 | | clear (coverage 0.15) | 3.0 |
+| overcast, 500 m features | 10.3 | | default | 5.4 |
+| overcast, looking up | 9.0 | | horizon | 4.7 |
+| into the sun | 6.3 | | sparse (coverage 0.15) | 2.6 |
+| looking straight up | 6.8 | | ground only | 1.3 |
 
-Worst case 11.4 ms, 1.6 ms inside the budget. Coverage is no longer the dial that decides whether
-the frame fits; the sun's position is, because a backlit sky is all transmittance and every
-sample pays the full light march.
+Worst case found is 10.3 ms, 2.7 ms inside the budget. Cost follows how much of the screen is
+cloud surface: each ray that enters cloud takes a handful of short steps, each with a light march.
 
-That table is the `fbm` algorithm. The other four cost between 10.1 and 12.6 ms on the same worst
-scene; the per-mode numbers are in *The five algorithms*.
+Where the time goes, and the levers:
 
-### How it got here
-
-It was ten times slower. The frame cost 16.4 ms at 1920x1080 in the default view — against a
-16.7 ms vsync budget, so the GPU never idled — and 33.7 ms looking up at coverage 0.85.
-
-`--bench` found where it went, by deleting one piece of work at a time at coverage 0.70:
-
-| Frame as built | 24.1 ms |
-| --- | --- |
-| ...with the sun light march removed | 4.3 ms |
-| ...with the noise replaced by a constant | 1.5 ms |
-
-**94% of the frame was value noise, and 82% of it was noise inside the light march.** Everything
-else together — sky, ray setup, the compositing loop, tone mapping — was 1.5 ms. The fix had to
-be the noise or it was not worth doing.
-
-Baking it into 3D textures did it: worst case 33.7 ms to 4.0 ms. A sample is now one filtered
-fetch, done by the texture units in fixed-function hardware alongside the shader's arithmetic,
-instead of five octaves of hash-and-interpolate. Two further things fell out of it that were not
-available before: mip levels chosen from the step length, which prefilter distant cloud instead
-of letting it alias, and a flattened histogram, which makes the coverage dial close to literal.
-
-Things measured and rejected along the way, all recorded so they are not retried:
-
-- **Adaptive empty-space skipping** (23.2 ms) and **a cheap probe before the full fBm** (23.9 ms),
-  both worth about 4%. Empty space was never where the time went; the light march was, and it
-  only runs where there is already cloud.
-- **Cheaper noise in the shadow march alone**, 5 octaves down to 2: 33.7 ms to 17.9 ms, and
-  visually almost free. A good change, made redundant by the textures.
-- **A hybrid** keeping the coarse octaves procedural and baking only the fine ones. It solves
-  tiling but only reaches 11.2 ms, because the coarse procedural octaves were most of the cost.
-- **A weather map** — a coarse read of the noise modulating the coverage threshold. One extra
-  fetch, and it loses to the warp on every repetition metric: its autocorrelation barely moves
-  from 1.000, because it shifts how much cloud there is while leaving the shapes repeating
-  exactly. Kept behind `WEATHER_AMOUNT = 0` only because it is the one lever that adds
-  large-scale structure rather than merely breaking a repeat.
-- **A second warp octave** (`WARP_SPLIT` below 1.0). In-view autocorrelation 0.467 against 0.473
-  for a single octave, and `axis_bias` worse at 1.38 against 1.01. Six more transcendentals for
-  nothing.
-- **Skipping the second texture read in the shadow march.** Cheaper, at 8.3 ms against 11.4, but
-  spending the same time on light steps instead is more accurate. Dominated on the frontier.
-
-Cost now scales with `PRIMARY_STEPS` times `LIGHT_STEPS`, and barely with the noise at all.
-
-### The step budget was split wrong
-
-That product is not the whole story, and getting the split wrong cost both quality and time.
-The march ran 64 view steps to 6 light steps for a long time. Moving sixteen samples from the
-first to the second — **48 view steps to 10 light steps** — raised accuracy against a 256x24-step
-reference from 0.9912 to 0.9985 SSIM *and* cost a millisecond less. The view march was
-oversampled and the shadow march starved.
-
-Extra light steps are nearly free: each is `LIGHT_STEP_GROWTH` times the last, so the later ones
-are long, leave the slab at once and return zero. Eight to twelve light steps spans 8.80 to
-8.95 ms. Past ten there is no further gain, and `PRIMARY_STEPS` above 48 buys nothing measurable
-for up to 1.2 ms.
-
-The scene that cared most was `backlit`, where the whole image is transmittance through cloud:
-0.9656 to 0.9920 SSIM on this change alone. A matrix of one scene would have missed it.
+- `STEP_MIN` and `STEP_GROWTH` set the in-cloud step. Halving them removed a visible hatch
+  pattern in the shading (the per-pixel jitter showing through) for about 2 ms.
+- `LIGHT_STEPS` scales the light march, which is two thirds of the frame: the overcast scene is
+  9.0 ms with eight light steps, 5.6 with four and 3.0 with none.
+- A completely clear sky costs 2.0 ms for the whole screen.
 
 ## Roadmap
 
 In rough order:
 
-1. A powder effect darkening the parts of a cloud facing the sun, for the way light scatters out
-   of thin edges. The step counts half of this item is done and measured; see *The step budget
-   was split wrong*.
-2. Close the rest of the repetition gap for the field-based algorithms. `fbm` sits at an
-   autocorrelation of 0.53 against a floor of 0.26; `islands` and `puffs` reach 0.39 and 0.37,
-   so the non-tiling content a warp cannot provide is what moves it. For `puffs` the remaining
-   self-similarity is the cell grid itself, which rotation moves but does not remove — a jittered
-   count of blobs per cell, or two interleaved grids at different spacings, would.
-3. Make the `puffs` clouds less uniform: they are one shape at one size, and real cumulus come in
-   clusters with flat bases. Two or three blobs per cell, and the per-cloud hash already spare in
-   `CellHash` used to offset the erosion read, are the cheap versions.
-4. Bake the noise with a compute shader instead of on the CPU. Worth 500 ms of startup across the
-   three textures, and it would put the fields back in the shader where they can hot-reload.
-5. Improve the sky and atmosphere: real Rayleigh and Mie scattering instead of a gradient. Aerial
-   perspective on distant clouds is done; a spherical cloud shell instead of a flat slab would let
-   the layer drop below the horizon naturally rather than stopping at `MAX_DISTANCE`.
+1. Temporal accumulation: blend each frame with the reprojected previous one. The remaining
+   grain at cloud edges is jitter noise, and this is the standard cure. It would also let the
+   step counts drop.
+2. Light the air under the clouds correctly. The atmosphere march assumes sunlit air everywhere,
+   which gives overcast skies and shadowed ground a blue-violet cast.
+3. More cloud types: a second, higher layer of thin cirrus, and anvil tops for the tallest
+   cumulus. Both are a profile and a weather-map channel, not new machinery.
+4. Bake the textures with compute shaders. Worth half a second of startup, and it would put the
+   noise back where it can hot-reload.
+5. A ground worth looking at: terrain, or at least texture.
 6. Replace the noise field with a real fluid simulation.
-
-Dropped: rendering at lower resolution with temporal reprojection. It existed to buy frame budget,
-and the textures bought ten times more without the reprojection artifacts or a second render
-target. `JITTER` stays for what it already does.
 
 ## Worktrees
 

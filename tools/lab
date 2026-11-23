@@ -13,8 +13,7 @@ change is judged on the whole matrix, because a win in one view that regresses
 another is not a win.
 
   tools/lab run baseline                     measure the tree as it stands
-  tools/lab run steps-128 --def PRIMARY_STEPS=128
-  tools/lab run puffs --algo puffs           measure one of the density algorithms
+  tools/lab run steps-fine --def STEP_MIN=14
   tools/lab noise-floor                      how much does --bench wobble?
   tools/lab report                           the quality/cost frontier so far
 
@@ -54,22 +53,22 @@ BUDGET_RES = "2560x1440"
 # cloud, how big, how slanted the rays, and where the sun is.
 SCENES = [
     # name            flags
-    ("default",       ["--coverage", "0.45", "--feature-size", "2600", "--pitch", "0.25"]),
+    ("default",       ["--coverage", "0.45", "--feature-size", "1500", "--pitch", "0.25"]),
     ("reported",      ["--coverage", "0.77", "--feature-size", "3300", "--shadow", "0.85",
                        "--exposure", "0.75", "--pitch", "0.35"]),
-    ("overcast-up",   ["--coverage", "0.85", "--feature-size", "2600", "--pitch", "0.55"]),
-    ("horizon",       ["--coverage", "0.60", "--feature-size", "2600", "--pitch", "0.02"]),
-    ("backlit",       ["--coverage", "0.60", "--feature-size", "2600", "--pitch", "0.20",
+    ("overcast-up",   ["--coverage", "0.85", "--feature-size", "1500", "--pitch", "0.55"]),
+    ("horizon",       ["--coverage", "0.60", "--feature-size", "1500", "--pitch", "0.02"]),
+    ("backlit",       ["--coverage", "0.60", "--feature-size", "1500", "--pitch", "0.20",
                        "--sun", "0.08", "--yaw", "0.6"]),
     ("small-features",["--coverage", "0.60", "--feature-size", "1500", "--pitch", "0.30"]),
-    ("clear",         ["--coverage", "0.15", "--feature-size", "2600", "--pitch", "0.25"]),
+    ("clear",         ["--coverage", "0.15", "--feature-size", "1500", "--pitch", "0.25"]),
 ]
 
 # Dials for the one field dump per config. The field's repetition is a
 # property of the noise, not of where the camera points, so it is measured
 # once rather than seven times. The dump is sized in tile units, so the
 # feature size here does not change what the metric sees.
-FIELD_DIALS = ["--coverage", "0.60", "--feature-size", "2600"]
+FIELD_DIALS = ["--coverage", "0.60", "--feature-size", "1500"]
 
 # `--algo NAME` on a run applies to every scene and to the field dump, so a
 # whole matrix can be measured against one density algorithm. It is a global
@@ -191,10 +190,7 @@ def cmd_run(argv: list[str]) -> int:
     i = 1
     while i < len(argv):
         a = argv[i]
-        if a in ("--algo", "--algorithm"):
-            i += 1
-            algo = argv[i]
-        elif a == "--def":
+        if a == "--def":
             i += 1
             defs.append(argv[i])
         elif a == "--note":

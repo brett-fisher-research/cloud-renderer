@@ -147,7 +147,7 @@ fn parse_args() -> Result<Args> {
                      --fullscreen                    open borderless at the monitor's resolution\n\
                      --screenshot <out.png>          render one frame headlessly to a PNG\n\
                      --dump-field <out.png>          top-down density field, linear, for analysis\n\
-                                                     (R full, G base only, B raw noise; 1024^2)\n\
+                                                     (R full, G no detail, B weather cover; 1024^2)\n\
                      --time <seconds>                animation time for the screenshot\n\
                      --sun <radians>                 sun elevation (0 = horizon, 1.57 = zenith)\n\
                      --yaw, --pitch <radians>        camera direction for the screenshot\n\
