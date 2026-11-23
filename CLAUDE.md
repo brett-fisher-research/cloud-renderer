@@ -67,6 +67,7 @@ cargo run --release                        # open a window at 1920x1080
 cargo run --release -- --size 2560x1440    # any size, in real pixels
 cargo run --release -- --fullscreen        # borderless, at the monitor's resolution
 cargo run --release -- --no-vsync          # uncapped, for benchmarking
+cargo run --release -- --bench             # headless GPU-timed benchmark, no window
 ```
 
 The window starts at 1920x1080 and can be dragged to any size; the surface is reconfigured on
@@ -106,7 +107,21 @@ it a bug: a disc that looks elliptical off-axis, for example, is correct rectili
 
 ## Performance
 
-Measured on an AMD RX 7800 XT (RADV, Mesa 24.2.8) via `--no-vsync`. Stages at 1280x720:
+`--bench` is the measuring instrument: a headless mode that renders the cloud pass over and
+over into an offscreen texture and times it with GPU timestamp queries, so the number is the
+GPU's own clock around that one pass, with no window, vsync, compositor or egui in it.
+
+```sh
+cargo run --release -- --bench                              # 48 frames at 1920x1080
+cargo run --release -- --bench --size 2560x1440 --coverage 0.85 --pitch 0.55 --label worst
+```
+
+It takes the same scene flags as `--screenshot`, so a scenario can be pinned down exactly and
+re-measured after a change. It reports median, min, p95 and mean; the median is the one to
+quote. Its 1280x720 reading agrees with the hand-timed `--no-vsync` numbers below to within a
+rounding error, which is what first validated it.
+
+Measured on an AMD RX 7800 XT (RADV, Mesa 24.2.8). Stages at 1280x720:
 
 | Stage | Frame time |
 | --- | --- |
@@ -127,6 +142,36 @@ size that still holds 60 fps on this card, which is why it is the default.
 Cost scales with `PRIMARY_STEPS` times `LIGHT_STEPS` times `FBM_OCTAVES`, since density is
 recomputed procedurally at every sample. That product is the first thing to cut when adding
 expensive effects.
+
+### Where the frame actually goes
+
+Measured with `--bench` at 1920x1080 by deleting one piece of work at a time. The scene is
+coverage 0.70, which is the expensive one: clear sky has nothing to march, and solid overcast
+hits `MIN_TRANSMITTANCE` and stops early, so the worst case is in between.
+
+| Frame as built | 24.1 ms |
+| --- | --- |
+| ...with the sun light march removed | 4.3 ms |
+| ...with the noise replaced by a constant | 1.5 ms |
+
+So **94% of the frame is value noise, and 82% of it is noise evaluated inside the light march**.
+Everything else together — sky, ray setup, the compositing loop, tone mapping — is 1.5 ms.
+
+The worst case is not the default view. Looking up at coverage 0.85, where long slanted rays
+cross the whole slab and nothing terminates early:
+
+| | 1920x1080 | 2560x1440 | 3840x2160 |
+| --- | --- | --- | --- |
+| Worst case (coverage 0.85, pitch 0.55) | 33.7 ms (30 fps) | 59.8 ms (17 fps) | 134 ms (7 fps) |
+
+This is why the GPU sits at 100%: at 1920x1080 the default view costs 16.4 ms against a 16.7 ms
+vsync budget, so the card never gets to idle, and any view worse than the default drops frames.
+
+Two things that *look* like the answer and are not, both measured and both worth about 4%:
+empty-space skipping with a coarse/fine adaptive march (23.2 ms), and a cheap 2-octave probe to
+reject clear sky before running the full fBm (23.9 ms). Neither helps, because empty space is
+not where the time goes — the light march is, and it only ever runs where there is already
+cloud.
 
 ## Roadmap
 

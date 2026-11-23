@@ -9,6 +9,7 @@
 //!   cargo run --release -- --screenshot out.png [--time 10.0] [--sun 0.4]
 
 mod app;
+mod bench;
 mod camera;
 mod gpu;
 mod params;
@@ -26,6 +27,11 @@ const DEFAULT_SIZE: (u32, u32) = (1920, 1080);
 
 struct Args {
     screenshot: Option<String>,
+    /// Headless benchmark instead of a window or a screenshot.
+    bench: bool,
+    bench_frames: u32,
+    /// Free-text tag printed with the benchmark line.
+    label: String,
     /// Render size in real pixels: window size, or screenshot size.
     size: (u32, u32),
     /// Open the window borderless-fullscreen at the monitor's own resolution.
@@ -43,6 +49,9 @@ struct Args {
 fn parse_args() -> Result<Args> {
     let mut args = Args {
         screenshot: None,
+        bench: false,
+        bench_frames: 48,
+        label: String::from("bench"),
         size: DEFAULT_SIZE,
         fullscreen: false,
         time: 0.0,
@@ -63,6 +72,14 @@ fn parse_args() -> Result<Args> {
                 args.size = parse_size(&v).with_context(|| format!("bad --size: {v}"))?;
             }
             "--fullscreen" => args.fullscreen = true,
+            "--bench" => args.bench = true,
+            "--bench-frames" => {
+                let v = it.next().context("--bench-frames needs a count")?;
+                args.bench_frames = v.parse().with_context(|| format!("bad --bench-frames: {v}"))?;
+            }
+            "--label" => {
+                args.label = it.next().context("--label needs a string")?;
+            }
             "--time" => {
                 let v = it.next().context("--time needs a number (seconds)")?;
                 args.time = v.parse().with_context(|| format!("bad --time: {v}"))?;
@@ -110,6 +127,9 @@ fn parse_args() -> Result<Args> {
                      --sun <radians>                 sun elevation (0 = horizon, 1.57 = zenith)\n\
                      --yaw, --pitch <radians>        camera direction for the screenshot\n\
                      --no-vsync                      uncap the frame rate (benchmarking)\n\
+                     --bench                         headless GPU-timed benchmark, no window\n\
+                     --bench-frames <n>              frames to time (default 48)\n\
+                     --label <text>                  tag printed with the benchmark line\n\
                      \n\
                      The four live dials. In a window these set where the sliders start:\n\
                      --coverage <0..1>               how much of the sky is cloud\n\
@@ -145,6 +165,20 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = parse_args()?;
+
+    if args.bench {
+        return bench::run(&bench::BenchOptions {
+            width: args.size.0,
+            height: args.size.1,
+            frames: args.bench_frames,
+            time: args.time,
+            sun_elevation: args.sun,
+            yaw: args.yaw,
+            pitch: args.pitch,
+            params: args.params,
+            label: args.label,
+        });
+    }
 
     match args.screenshot {
         Some(path) => screenshot::render_to_png(

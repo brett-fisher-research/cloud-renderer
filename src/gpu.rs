@@ -75,10 +75,17 @@ impl Gpu {
             info.driver_info
         );
 
+        // Timestamp queries let the GPU time its own work (see `--bench`).
+        // Optional: ask for it only if this adapter has it, so a driver
+        // without it still runs everything else.
+        let features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        if features.is_empty() {
+            log::warn!("adapter has no TIMESTAMP_QUERY; --bench will not work");
+        }
+
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("cloud-renderer device"),
-            // The MVP needs nothing beyond the baseline feature set.
-            required_features: wgpu::Features::empty(),
+            required_features: features,
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,

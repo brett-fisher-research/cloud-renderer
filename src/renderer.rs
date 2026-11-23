@@ -148,6 +148,18 @@ impl Renderer {
 
     /// Record the single full-screen draw into `encoder`.
     pub fn draw(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+        self.draw_timed(encoder, view, None);
+    }
+
+    /// As [`Renderer::draw`], but optionally asks the GPU to write its own
+    /// clock at the start and end of the pass. That is how `--bench` measures
+    /// the cloud pass by itself, with no vsync or compositor in the number.
+    pub fn draw_timed(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
         // A render pass is a scope that targets one or more textures. Ours
         // clears the target and then draws three vertices over it.
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -163,7 +175,7 @@ impl Renderer {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes,
             occlusion_query_set: None,
             multiview_mask: None,
         });
