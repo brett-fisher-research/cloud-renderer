@@ -1,0 +1,303 @@
+#!/usr/bin/env -S uv run --script
+# usage: tools/lab run <name> [--def K=V]... [--note "..."] | tools/lab noise-floor | tools/lab report
+# desc: Run the cloud-renderer scene matrix and append the results to the lab notebook
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""The measuring harness.
+
+One command measures a candidate change across every scene that matters and
+appends the numbers to docs/experiments.jsonl, which is never rewritten. A
+change is judged on the whole matrix, because a win in one view that regresses
+another is not a win.
+
+  tools/lab run baseline                     measure the tree as it stands
+  tools/lab run steps-128 --def PRIMARY_STEPS=128
+  tools/lab noise-floor                      how much does --bench wobble?
+  tools/lab report                           the quality/cost frontier so far
+
+Perf comes from --bench, which brackets the cloud pass in GPU timestamp
+queries: no vsync, no compositor, no egui. Quality comes from --dump-field
+scored by tools/fieldstat. The two are measured in the same run so a row can
+never pair one change's speed with another's picture.
+"""
+
+import json
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BIN = ROOT / "target/release/cloud-renderer"
+NOTEBOOK = ROOT / "docs/experiments.jsonl"
+SHOTS = ROOT / "out/lab"
+FIELDSTAT = ROOT / "tools/fieldstat"
+
+# The budget this project is optimising against: 60 fps at 1440p, with room
+# left under it for vsync, egui and thermal drift.
+BUDGET_MS = 13.0
+BUDGET_RES = "2560x1440"
+
+# The scene matrix. Every candidate is measured on all of these.
+#
+# `reported` is the exact configuration from the screenshot that started this
+# work, so the complaint itself stays in the matrix and cannot be optimised
+# around. The rest span the axes that change the cost or the look: how much
+# cloud, how big, how slanted the rays, and where the sun is.
+SCENES = [
+    # name            flags
+    ("default",       ["--coverage", "0.45", "--feature-size", "2600", "--pitch", "0.25"]),
+    ("reported",      ["--coverage", "0.77", "--feature-size", "3300", "--shadow", "0.85",
+                       "--exposure", "0.75", "--pitch", "0.35"]),
+    ("overcast-up",   ["--coverage", "0.85", "--feature-size", "2600", "--pitch", "0.55"]),
+    ("horizon",       ["--coverage", "0.60", "--feature-size", "2600", "--pitch", "0.02"]),
+    ("backlit",       ["--coverage", "0.60", "--feature-size", "2600", "--pitch", "0.20",
+                       "--sun", "0.08", "--yaw", "0.6"]),
+    ("small-features",["--coverage", "0.60", "--feature-size", "1500", "--pitch", "0.30"]),
+    ("clear",         ["--coverage", "0.15", "--feature-size", "2600", "--pitch", "0.25"]),
+]
+
+# Dials for the one field dump per config. The field's repetition is a
+# property of the noise, not of where the camera points, so it is measured
+# once rather than seven times. The dump is sized in tile units, so the
+# feature size here does not change what the metric sees.
+FIELD_DIALS = ["--coverage", "0.60", "--feature-size", "2600"]
+
+BENCH_RE = re.compile(
+    r"gpu median\s+([\d.]+) ms.*?min\s+([\d.]+)\s+p95\s+([\d.]+)\s+mean\s+([\d.]+)"
+)
+
+
+def die(msg: str) -> None:
+    print(f"lab: {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def run(args: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(args, capture_output=True, text=True, cwd=ROOT, **kw)
+
+
+def git_rev() -> str:
+    p = run(["git", "rev-parse", "--short", "HEAD"])
+    return p.stdout.strip() if p.returncode == 0 else "unknown"
+
+
+def dirty() -> bool:
+    return bool(run(["git", "status", "--porcelain"]).stdout.strip())
+
+
+def build() -> None:
+    p = run(["cargo", "build", "--release"])
+    if p.returncode != 0:
+        die(f"cargo build failed:\n{p.stderr}")
+
+
+def bench(flags: list[str], defs: list[str], res: str, frames: int = 48) -> dict:
+    cmd = [str(BIN), "--bench", "--size", res, "--bench-frames", str(frames), *flags]
+    for d in defs:
+        cmd += ["--def", d]
+    p = run(cmd)
+    if p.returncode != 0:
+        die(f"bench failed:\n{p.stdout}\n{p.stderr}")
+    m = BENCH_RE.search(p.stdout)
+    if not m:
+        die(f"could not parse bench output:\n{p.stdout}")
+    return {
+        "ms_median": float(m.group(1)),
+        "ms_min": float(m.group(2)),
+        "ms_p95": float(m.group(3)),
+        "ms_mean": float(m.group(4)),
+    }
+
+
+def shoot(path: Path, flags: list[str], defs: list[str], extra: list[str] = ()) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [str(BIN), "--screenshot", str(path), *flags, *extra]
+    for d in defs:
+        cmd += ["--def", d]
+    p = run(cmd)
+    if p.returncode != 0:
+        die(f"screenshot failed:\n{p.stdout}\n{p.stderr}")
+
+
+def dump_field(path: Path, defs: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [str(BIN), "--dump-field", str(path), *FIELD_DIALS]
+    for d in defs:
+        cmd += ["--def", d]
+    p = run(cmd)
+    if p.returncode != 0:
+        die(f"field dump failed:\n{p.stdout}\n{p.stderr}")
+
+
+def fieldstat(path: Path, channel: str) -> dict:
+    p = run(["uv", "run", "--quiet", str(FIELDSTAT), str(path), "--channel", channel, "--json"])
+    if p.returncode != 0:
+        die(f"fieldstat failed:\n{p.stderr}")
+    return json.loads(p.stdout)[0]
+
+
+def append(row: dict) -> None:
+    NOTEBOOK.parent.mkdir(parents=True, exist_ok=True)
+    with NOTEBOOK.open("a") as f:
+        f.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+
+def load() -> list[dict]:
+    if not NOTEBOOK.exists():
+        return []
+    return [json.loads(line) for line in NOTEBOOK.read_text().splitlines() if line.strip()]
+
+
+# --------------------------------------------------------------------------
+#  Commands
+# --------------------------------------------------------------------------
+
+def cmd_run(argv: list[str]) -> int:
+    if not argv:
+        die('run needs a config name, e.g. tools/lab run baseline --def TILE_SCALE=6.0')
+    name, defs, note, frames = argv[0], [], "", 48
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--def":
+            i += 1
+            defs.append(argv[i])
+        elif a == "--note":
+            i += 1
+            note = argv[i]
+        elif a == "--frames":
+            i += 1
+            frames = int(argv[i])
+        else:
+            die(f"unknown option {a}")
+        i += 1
+
+    build()
+    rev, is_dirty = git_rev(), dirty()
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    out = SHOTS / name
+    if out.exists():
+        shutil.rmtree(out)
+
+    # One field dump for the whole config.
+    field_png = out / "field.png"
+    dump_field(field_png, defs)
+    field = {
+        f"{ch}_{k}": fieldstat(field_png, ch)[k]
+        for ch in ("base", "raw")
+        for k in ("tile_lock", "acorr_peak", "axis_bias")
+    }
+    field["acorr_lag_px"] = fieldstat(field_png, "base")["acorr_lag_px"]
+
+    print(f"\n{name}  ({rev}{'+dirty' if is_dirty else ''})"
+          f"{'  defs: ' + ','.join(defs) if defs else ''}")
+    print(f"  field: tile_lock {field['base_tile_lock']:.3f}  "
+          f"acorr {field['base_acorr_peak']:.3f}  axis {field['base_axis_bias']:.2f}"
+          f"   (raw: {field['raw_tile_lock']:.3f} / {field['raw_acorr_peak']:.3f} "
+          f"/ {field['raw_axis_bias']:.2f})")
+    print(f"  {'scene':<16} {'median':>8} {'p95':>8}  budget")
+
+    worst = 0.0
+    for scene, flags in SCENES:
+        perf = bench(flags, defs, BUDGET_RES, frames)
+        shot = out / f"{scene}.png"
+        shoot(shot, flags, defs)
+        worst = max(worst, perf["ms_median"])
+        over = perf["ms_median"] > BUDGET_MS
+        print(f"  {scene:<16} {perf['ms_median']:>7.2f}ms {perf['ms_p95']:>7.2f}ms  "
+              f"{'OVER' if over else 'ok':>5}")
+        append({
+            "ts": stamp, "config": name, "note": note, "git": rev, "dirty": is_dirty,
+            "defs": defs, "scene": scene, "res": BUDGET_RES, "frames": frames,
+            **perf, **field,
+            "shot": str(shot.relative_to(ROOT)),
+            "field_png": str(field_png.relative_to(ROOT)),
+        })
+
+    headroom = BUDGET_MS - worst
+    print(f"  worst {worst:.2f} ms, {headroom:+.2f} ms against the {BUDGET_MS:.0f} ms budget"
+          f"  -> {'FITS' if headroom >= 0 else 'DOES NOT FIT'}")
+    return 0
+
+
+def cmd_noise_floor(argv: list[str]) -> int:
+    """How much does the same measurement move when nothing changes?"""
+    repeats = int(argv[0]) if argv else 10
+    build()
+    flags = dict(SCENES)["overcast-up"]
+    print(f"noise floor: {repeats} identical runs of 'overcast-up' at {BUDGET_RES}")
+    runs = []
+    for i in range(repeats):
+        r = bench(flags, [], BUDGET_RES)["ms_median"]
+        runs.append(r)
+        print(f"  {i + 1:>2}  {r:.3f} ms")
+        time.sleep(0.5)  # let the GPU settle, so this measures noise not thermals
+
+    lo, hi = min(runs), max(runs)
+    mean = statistics.mean(runs)
+    sd = statistics.stdev(runs) if len(runs) > 1 else 0.0
+    spread_pct = (hi - lo) / mean * 100
+    print(f"\n  mean {mean:.3f} ms   sd {sd:.3f} ms ({sd / mean * 100:.2f}%)"
+          f"   range {lo:.3f}-{hi:.3f} ({spread_pct:.2f}%)")
+    # Two standard deviations is the bar a change has to clear to be reported
+    # as real rather than as noise.
+    print(f"  => call an effect real only above {2 * sd:.3f} ms "
+          f"({2 * sd / mean * 100:.2f}%)")
+    append({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "config": "_noise_floor", "git": git_rev(), "scene": "overcast-up",
+        "res": BUDGET_RES, "runs": runs, "mean": mean, "sd": sd,
+        "threshold_ms": 2 * sd,
+    })
+    return 0
+
+
+def cmd_report(argv: list[str]) -> int:
+    rows = [r for r in load() if r.get("config", "").startswith("_") is False]
+    if not rows:
+        print("lab: notebook is empty; run 'tools/lab run baseline' first")
+        return 0
+
+    configs: dict[str, dict] = {}
+    for r in rows:
+        c = configs.setdefault(r["config"], {"scenes": {}, "row": r})
+        c["scenes"][r["scene"]] = r["ms_median"]
+        c["row"] = r  # last wins: a re-run supersedes
+
+    print(f"{'config':<22} {'worst ms':>9} {'tile_lock':>10} {'acorr':>7} {'axis':>6}  fits")
+    print("-" * 70)
+    for name, c in configs.items():
+        row, worst = c["row"], max(c["scenes"].values())
+        fits = "yes" if worst <= BUDGET_MS else "NO"
+        print(f"{name:<22} {worst:>9.2f} {row.get('base_tile_lock', float('nan')):>10.3f} "
+              f"{row.get('base_acorr_peak', float('nan')):>7.3f} "
+              f"{row.get('base_axis_bias', float('nan')):>6.2f}  {fits}")
+    print(f"\nbudget {BUDGET_MS:.0f} ms at {BUDGET_RES}; "
+          f"{len(rows)} rows in {NOTEBOOK.relative_to(ROOT)}")
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    cmd, rest = argv[0], argv[1:]
+    if not BIN.exists() and cmd != "report":
+        build()
+    return {
+        "run": cmd_run,
+        "noise-floor": cmd_noise_floor,
+        "report": cmd_report,
+    }.get(cmd, lambda _: die(f"unknown command {cmd!r}"))(rest)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
