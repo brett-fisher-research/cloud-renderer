@@ -118,8 +118,14 @@ def bench(flags: list[str], defs: list[str], res: str, frames: int = 48) -> dict
 
 
 def shoot(path: Path, flags: list[str], defs: list[str], extra: list[str] = ()) -> None:
+    """Render at BUDGET_RES, the same size the scene was timed at.
+
+    These were taken at the default 1920x1080 at first while the benchmark ran
+    at 2560x1440, which made the picture and the timing describe different
+    frames and made them unusable against a reference rendered at either size.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [str(BIN), "--screenshot", str(path), *flags, *extra]
+    cmd = [str(BIN), "--screenshot", str(path), "--size", BUDGET_RES, *flags, *extra]
     for d in defs:
         cmd += ["--def", d]
     p = run(cmd)

@@ -28,7 +28,12 @@ const CLOUD_TOP:    f32 = 3000.0;
 const MAX_DISTANCE: f32 = 50000.0;
 
 // --- Raymarching ---
-const PRIMARY_STEPS: i32 = 64;      // samples along the view ray
+// Samples along the view ray. 64 for a long time, and that was too many:
+// moving sixteen of them into the light march below raised accuracy
+// against a 256x24-step reference from 0.9912 to 0.9985 SSIM *and* cost
+// a millisecond less. The view march was oversampled and the shadow
+// march starved.
+const PRIMARY_STEPS: i32 = 48;
 // Give up once the cloud has blocked ~99% of the light behind it.
 const MIN_TRANSMITTANCE: f32 = 0.01;
 // Offset each pixel's first sample by up to this fraction of a step. With a
@@ -61,6 +66,128 @@ const TILE_SCALE: f32 = 4.0;
 const DETAIL_SCALE: f32 = 11.0;
 const DETAIL_STRENGTH: f32 = 0.45;
 
+// --- Breaking the texture's repeat ---
+//
+// The base texture tiles every TILE_SCALE feature sizes: 10.4 km at the
+// default dial, against a MAX_DISTANCE of 50 km. So a single view can hold
+// five copies of the same sky in each direction, and in perspective a
+// repeating lattice on a horizontal plane projects to lines converging on a
+// vanishing point — the radial moire at the horizon.
+//
+// The repeat does not have to be removed, only pushed past the view. Two
+// levers, both off at 0.0 so they can be measured one at a time:
+//
+// WARP is an analytic displacement of the lookup point, costing a few sin
+// and cos and no bandwidth at all. Its period is an irrational multiple of
+// the tile, so the warped field has no exact period: a shift that lines the
+// tiles up leaves the warp out of phase, and the other way round.
+//
+// WEATHER is a second, much coarser read of the same texture that pushes the
+// coverage threshold up and down across the sky. It costs one extra fetch,
+// and it is what large-scale structure in a real sky looks like: regions of
+// more and less cloud, rather than an even wash of identical puffs.
+
+// The warp's strength, given as a guaranteed bound on its gradient. 0 is off.
+//
+// This is the parameter that matters, so it is the one exposed. A warp whose
+// Jacobian reaches 1.0 somewhere stops being injective: the domain folds back
+// through itself and the field creases along the fold, which shows up as a
+// hard-edged tear across an otherwise soft cloud. Below 1.0 that cannot
+// happen. The displacement amplitude is derived from this bound rather than
+// set directly, because amplitude alone says nothing about folding — the same
+// displacement is violent at a short wavelength and gentle at a long one.
+const WARP_GRADIENT: f32 = 0.9;
+
+// Warp wavelength, in tiles, for each of two octaves.
+//
+// Long is better than short, which is not obvious. The thing that breaks the
+// repeat is how much the displacement *differs* between two points one tile
+// apart, and for a sinusoid of wavelength L that difference is proportional
+// to L*sin(pi*T/L): it rises with L and saturates at pi*T. At L = 1.618 tiles
+// only 48% of the gradient budget turns into useful decorrelation; by 5 tiles
+// it is 93%.
+//
+// Both are irrational multiples of the tile, and of each other, so no small
+// whole number of warp periods ever lines up with a whole number of tiles.
+const WARP_PERIOD: f32 = 9.8696044;
+const WARP_PERIOD_2: f32 = 1.6180339;
+// Share of the gradient budget on the long octave. 1.0 spends it all there
+// and skips the second octave's six transcendentals entirely.
+const WARP_SPLIT: f32 = 1.0;
+
+// Reuse the view sample's warp for every step of the shadow march.
+//
+// The shadow march walks about a kilometre and the warp varies over tens of
+// them, so the displacement it would compute at each step is close to the one
+// already computed at the sample it started from. Sharing turns seven warp
+// evaluations per sample into one. The shadow is a six-step approximation of
+// an integral through cloud; this is far from the coarsest thing about it.
+const WARP_SHARED_SHADOW: bool = true;
+
+// --- A second, incommensurately scaled read ---
+//
+// The warp moves the field about; this changes what is in it. The difference
+// matters. A warp is a smooth map, and over any local region a smooth map
+// acts like a constant shift — so the field's periodicity is not destroyed,
+// only relabelled to a different lag. Measured: the warp alone stalls at an
+// in-view autocorrelation of 0.65 against a floor of 0.26, with its residual
+// peak sitting at almost exactly six tiles.
+//
+// Reading the same texture a second time at a scale that is an irrational
+// multiple of the first gives a combined field whose period is the two
+// periods' common multiple, which does not exist. It costs one fetch.
+const MIX_AMOUNT: f32 = 0.5;
+// Irrational, and close to 1 so the second read's features are about the same
+// size as the first's and the clouds keep their character.
+const MIX_SCALE: f32 = 0.6180339;
+// An arbitrary shift, so the two reads do not start from the same corner of
+// the texture and agree near the origin.
+const MIX_OFFSET: vec3<f32> = vec3<f32>(0.37, 0.11, 0.73);
+// Whether the shadow march pays for the second read too. Off keeps the
+// shadows consistent with a cheaper field, as the detail texture already does.
+const MIX_IN_SHADOW: bool = true;
+
+// How far the coarse read moves the coverage threshold. 0 disables it.
+//
+// Kept because it is the only lever here that adds *large-scale structure* —
+// regions of more and less cloud — rather than only breaking a repeat. On
+// repetition alone it loses to the warp outright; see the commit message.
+const WEATHER_AMOUNT: f32 = 0.0;
+// Its scale relative to the base read. Below 1 means a coarser field: at
+// 0.382 the weather pattern is 2.6 tiles across, so it varies over 27 km
+// while the clouds themselves vary over 2.6 km.
+const WEATHER_SCALE: f32 = 0.3819660;
+
+// One octave of displacement. Each axis is driven by the *other* axes: a warp
+// of x by x alone would only stretch and squeeze the field along x and would
+// leave its lattice intact.
+//
+// The row sums of this function's Jacobian are k*(1 + 0.7*1.7) = 2.19k,
+// k*0.6*1.3 = 0.78k and k*(1 + 0.7*1.1) = 1.77k, so scaling the amplitude by
+// gradient/(2.19*k) holds the whole Jacobian under `gradient`.
+fn warp_octave(p: vec3<f32>, k: f32, gradient: f32) -> vec3<f32> {
+    let amp = gradient / (2.19 * k);
+    return amp * vec3<f32>(
+        sin(p.z * k) + 0.7 * cos(p.y * k * 1.7),
+        0.6 * sin(p.x * k * 1.3),
+        cos(p.x * k) + 0.7 * sin(p.y * k * 1.1),
+    );
+}
+
+/// The displacement to add to a lookup point, in metres.
+fn warp_at(p: vec3<f32>, tile: f32) -> vec3<f32> {
+    if (WARP_GRADIENT <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let k1 = 6.2831853 / (tile * WARP_PERIOD);
+    var d = warp_octave(p, k1, WARP_GRADIENT * WARP_SPLIT);
+    if (WARP_SPLIT < 1.0) {
+        let k2 = 6.2831853 / (tile * WARP_PERIOD_2);
+        d += warp_octave(p, k2, WARP_GRADIENT * (1.0 - WARP_SPLIT));
+    }
+    return d;
+}
+
 // How much of the sky is cloud is a live dial: `p.coverage`.
 // Where in the slab the cloud sits: fractions of the layer height.
 const CLOUD_BASE_SOFTNESS: f32 = 0.22;  // fade-in above the bottom
@@ -80,7 +207,14 @@ const WIND: vec3<f32> = vec3<f32>(-9.0, 0.0, -3.0);  // metres per second
 
 // --- Lighting ---
 // Steps taken towards the sun from each view sample to find the shadow.
-const LIGHT_STEPS: i32 = 6;
+//
+// Ten rather than six, and nearly free: each step is LIGHT_STEP_GROWTH
+// times the last, so the extra ones are long, leave the slab almost at
+// once and return zero. Measured, 8 to 12 steps spans 8.80 to 8.95 ms.
+// Six was visibly too few for a backlit sky, where the whole image is
+// transmittance through cloud: that scene alone went from 0.9656 to
+// 0.9920 SSIM on this change. Past ten there is no further gain.
+const LIGHT_STEPS: i32 = 10;
 const LIGHT_STEP_SIZE: f32 = 110.0;   // metres, length of the first step
 const LIGHT_STEP_GROWTH: f32 = 1.55;  // each step is longer than the last
 const SUN_LIGHT: vec3<f32> = vec3<f32>(1.0, 0.93, 0.80);
@@ -282,6 +416,24 @@ fn cloud_noise(q: vec3<f32>, lod: vec2<f32>, detail: bool) -> f32 {
     // Which suits us, because the right level here has nothing to do with
     // screen space and everything to do with how long a march step is.
     var n = textureSampleLevel(noise_base, noise_sampler, q, lod.x).r;
+
+    if (MIX_AMOUNT > 0.0 && (detail || MIX_IN_SHADOW)) {
+        // The second read traverses the texture more slowly, so its features
+        // are larger in world space and it can afford a finer mip.
+        let mix_lod = max(0.0, lod.x + log2(MIX_SCALE));
+        let m = textureSampleLevel(
+            noise_base, noise_sampler, q * MIX_SCALE + MIX_OFFSET, mix_lod
+        ).r;
+        // Blending two fields that do not agree shrinks the spread of the
+        // result: two independent values averaged have half the variance.
+        // Rescaling about the mean puts it back, so the flattened histogram
+        // the bake worked for survives and the coverage dial keeps meaning
+        // what it says.
+        let w = MIX_AMOUNT;
+        let k = 1.0 / sqrt((1.0 - w) * (1.0 - w) + w * w);
+        n = 0.5 + (mix(n, m, w) - 0.5) * k;
+    }
+
     if (detail) {
         let d = textureSampleLevel(noise_detail, noise_sampler, q * DETAIL_SCALE, lod.y).r;
         // Erode inwards from the edges: push hardest where the base is
@@ -314,7 +466,7 @@ fn mip_for_step(step: f32) -> vec2<f32> {
 }
 
 // Density of the cloud medium at a world-space point.
-fn cloud_density_at(p: vec3<f32>, lod: vec2<f32>, detail: bool) -> f32 {
+fn cloud_density_at(p: vec3<f32>, lod: vec2<f32>, detail: bool, warp: vec3<f32>) -> f32 {
     // Height through the layer, 0 at the bottom and 1 at the top.
     let h = (p.y - CLOUD_BOTTOM) / (CLOUD_TOP - CLOUD_BOTTOM);
     if (h < 0.0 || h > 1.0) {
@@ -328,8 +480,9 @@ fn cloud_density_at(p: vec3<f32>, lod: vec2<f32>, detail: bool) -> f32 {
 
     // Scroll the noise field to make the clouds drift. Moving the *sample
     // point* against the wind is the same as moving the clouds with it.
-    let drift = WIND * u.time;
-    let q = (p + drift) / (dials.feature_size * TILE_SCALE);
+    let tile = dials.feature_size * TILE_SCALE;
+    let drifted = p + WIND * u.time;
+    let q = (drifted + warp) / tile;
 
     let n = cloud_noise(q, lod, detail);
 
@@ -339,15 +492,24 @@ fn cloud_density_at(p: vec3<f32>, lod: vec2<f32>, detail: bool) -> f32 {
     //
     // The bake flattened the field's histogram, so this dial is close to
     // literal: 0.45 means about 45% of the layer is above the threshold.
-    let threshold = 1.0 - dials.coverage;
+    var threshold = 1.0 - dials.coverage;
+
+    // Weather: a coarse read of the same texture nudges that threshold up and
+    // down across the sky. Centred on zero, so the dial keeps the meaning the
+    // histogram flattening gave it rather than quietly gaining cloud.
+    if (WEATHER_AMOUNT > 0.0) {
+        let w = cloud_noise(drifted * (WEATHER_SCALE / tile), lod, false);
+        threshold += (w - 0.5) * WEATHER_AMOUNT;
+    }
+
     let shaped = clamp((n - threshold) / max(dials.coverage, 0.001), 0.0, 1.0);
 
     return shaped * profile * DENSITY;
 }
 
 // The view ray wants every bit of detail the step length can carry.
-fn cloud_density(p: vec3<f32>, lod: vec2<f32>) -> f32 {
-    return cloud_density_at(p, lod, true);
+fn cloud_density(p: vec3<f32>, lod: vec2<f32>, warp: vec3<f32>) -> f32 {
+    return cloud_density_at(p, lod, true, warp);
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +541,7 @@ fn cloud_phase(cos_theta: f32) -> f32 {
 // get longer as they go, because distant blockers matter less than nearby
 // ones and this buys depth cheaply. Six steps is enough to read as shadowing.
 // These samples skip the detail texture: see `cloud_noise`.
-fn light_march(p: vec3<f32>, lod: vec2<f32>) -> f32 {
+fn light_march(p: vec3<f32>, lod: vec2<f32>, warp: vec3<f32>, tile: f32) -> f32 {
     var optical_depth = 0.0;
     var t = 0.0;
     var step = LIGHT_STEP_SIZE;
@@ -387,7 +549,13 @@ fn light_march(p: vec3<f32>, lod: vec2<f32>) -> f32 {
     for (var i = 0; i < LIGHT_STEPS; i = i + 1) {
         // Sample at the middle of the step.
         let sp = p + u.sun_dir * (t + step * 0.5);
-        optical_depth += cloud_density_at(sp, lod, false) * step;
+        // See WARP_SHARED_SHADOW: reusing the view sample's displacement here
+        // turns seven warp evaluations per sample into one.
+        var w = warp;
+        if (!WARP_SHARED_SHADOW) {
+            w = warp_at(sp + WIND * u.time, tile);
+        }
+        optical_depth += cloud_density_at(sp, lod, false, w) * step;
         t += step;
         step *= LIGHT_STEP_GROWTH;
     }
@@ -430,6 +598,7 @@ fn march_clouds(
     // shallow crosses so much cloud that MIN_TRANSMITTANCE breaks the loop
     // after a handful of samples.
     let dt = (hit.y - hit.x) / f32(PRIMARY_STEPS);
+    let tile = dials.feature_size * TILE_SCALE;
 
     // Both of these are the same for every sample along this ray, so they are
     // worked out once per pixel rather than once per step: the mip level
@@ -452,7 +621,8 @@ fn march_clouds(
         let t = hit.x + (f32(i) + offset) * dt;
         let p = origin + dir * t;
 
-        let density = cloud_density(p, lod);
+        let warp = warp_at(p + WIND * u.time, tile);
+        let density = cloud_density(p, lod, warp);
         if (density <= 0.0) {
             continue;
         }
@@ -461,7 +631,7 @@ fn march_clouds(
         let step_transmittance = exp(-sigma * dt);
 
         // How much sun reaches this point through the cloud above it.
-        let sun_visibility = light_march(p, light_lod);
+        let sun_visibility = light_march(p, light_lod, warp, tile);
         let sunlight = SUN_LIGHT * SUN_LIGHT_INTENSITY * sun_visibility * phase;
 
         // Skylight, dimmed towards the base where less of the dome is visible.
@@ -519,13 +689,14 @@ fn fs_field(in: VsOut) -> @location(0) vec4<f32> {
     // particular march step length would make of it.
     let lod = vec2<f32>(0.0, 0.0);
 
-    let full = cloud_density_at(p, lod, true);
-    let base = cloud_density_at(p, lod, false);
+    let warp = warp_at(p + WIND * u.time, tile);
+    let full = cloud_density_at(p, lod, true, warp);
+    let base = cloud_density_at(p, lod, false, warp);
 
     // The raw field, before the coverage threshold. That threshold is a hard
     // nonlinearity and manufactures harmonics of its own, so the honest input
     // to a spectrum is the field itself.
-    let raw = cloud_noise((p + WIND * u.time) / tile, lod, true);
+    let raw = cloud_noise((p + WIND * u.time + warp) / tile, lod, true);
 
     return vec4<f32>(full, base, raw, 1.0);
 }

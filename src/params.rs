@@ -50,13 +50,17 @@ impl Default for Params {
 /// command-line clamping agree.
 impl Params {
     pub const COVERAGE_RANGE: std::ops::RangeInclusive<f32> = 0.0..=1.0;
-    /// The floor used to be 300 m. The noise is now a tiling 3D texture whose
-    /// tile is four times the feature size, so a small feature size means a
-    /// short repeat — at 300 m the field wraps every 1.2 km, which across a
-    /// 50 km view is forty repeats and reads as a radial moiré at the horizon.
-    /// 1500 m is where that stops being noticeable. Getting the bottom of the
-    /// range back means breaking the repeat up, not a bigger texture.
-    pub const FEATURE_SIZE_RANGE: std::ops::RangeInclusive<f32> = 1500.0..=10000.0;
+    /// Back to 300 m. The floor was 1500 m for as long as the noise was a
+    /// plain tiling texture: the tile is four times the feature size, so at
+    /// 300 m the field wrapped every 1.2 km, and across a 50 km view that is
+    /// forty repeats, which read as a radial moiré converging at the horizon.
+    ///
+    /// The shader now warps the lookup point and blends a second read at an
+    /// incommensurate scale, which pushes the repeat past the view. Measured
+    /// at 300 m: tile_lock 0.051 and in-view autocorrelation 0.485, against
+    /// 1.000 and 1.000 before, and the render at a near-horizon pitch shows
+    /// no moiré at all. See the repetition section of CLAUDE.md.
+    pub const FEATURE_SIZE_RANGE: std::ops::RangeInclusive<f32> = 300.0..=10000.0;
     pub const SHADOW_STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
     pub const EXPOSURE_RANGE: std::ops::RangeInclusive<f32> = 0.1..=4.0;
 }
