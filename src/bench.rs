@@ -127,7 +127,7 @@ pub fn run(opts: &BenchOptions) -> Result<()> {
     let mean = samples.iter().sum::<f64>() / n as f64;
 
     println!(
-        "{label:<28} {w}x{h}  cov {cov:.2}  feat {feat:<5.0}  \
+        "{label:<28} {w}x{h}  {algo:<8} cov {cov:.2}  feat {feat:<5.0}  \
          gpu median {median:6.2} ms ({fps:5.1} fps)  min {min:6.2}  p95 {p95:6.2}  \
          mean {mean:6.2}  wall {wall:.2}s{defs}",
         label = opts.label,
@@ -138,6 +138,7 @@ pub fn run(opts: &BenchOptions) -> Result<()> {
         },
         w = width,
         h = height,
+        algo = opts.params.algorithm().name(),
         cov = opts.params.coverage,
         feat = opts.params.feature_size,
         median = median,

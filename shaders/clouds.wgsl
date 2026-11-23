@@ -146,6 +146,11 @@ const MIX_OFFSET: vec3<f32> = vec3<f32>(0.37, 0.11, 0.73);
 // Whether the shadow march pays for the second read too. Off keeps the
 // shadows consistent with a cheaper field, as the detail texture already does.
 const MIX_IN_SHADOW: bool = true;
+// The same question for the `billow` mode's Worley read. Off, because a
+// shadow is an integral of density along a line and the bulges average out of
+// it: measured at 2560x1440 on the worst scene, on against off is 16.0 ms
+// against 11.9 for no visible difference in the picture.
+const BILLOW_IN_SHADOW: bool = false;
 
 // How far the coarse read moves the coverage threshold. 0 disables it.
 //
@@ -267,6 +272,10 @@ struct Params {
     feature_size: f32,     // metres: size of the largest noise features
     shadow_strength: f32,  // scales self-shadowing; low fakes multiple scattering
     exposure: f32,         // overall brightness, applied before tone mapping
+    algorithm: u32,        // which density field to build: see ALGO_* below
+    _pad0: f32,            // a uniform block comes in rows of sixteen bytes;
+    _pad1: f32,            // these are the rest of the row `algorithm` opened,
+    _pad2: f32,            // and the next three dials to want one are free.
 };
 
 @group(0) @binding(1) var<uniform> dials: Params;
@@ -392,6 +401,9 @@ fn slab_intersect(origin: vec3<f32>, dir: vec3<f32>) -> vec2<f32> {
 @group(0) @binding(2) var noise_base: texture_3d<f32>;
 @group(0) @binding(3) var noise_detail: texture_3d<f32>;
 @group(0) @binding(4) var noise_sampler: sampler;
+// Cellular (Worley) noise, used by the `billow` algorithm. Baked at startup
+// like the other two; see `bake_worley` in src/noise.rs.
+@group(0) @binding(5) var noise_worley: texture_3d<f32>;
 
 // "Interleaved gradient noise": a cheap screen-space dither that looks evenly
 // scattered rather than streaky. It depends only on the pixel coordinate, so
@@ -465,12 +477,335 @@ fn mip_for_step(step: f32) -> vec2<f32> {
     );
 }
 
+// ---------------------------------------------------------------------------
+//  THE FIVE ALGORITHMS
+//
+//  `dials.algorithm` chooses which density field the march samples. Everything
+//  else — the slab, the raymarch, the light march, the phase function, the
+//  aerial perspective, the tone map — is identical between them. Only the
+//  function answering "how much cloud is at this point" changes, which is
+//  where the look of a cloud renderer actually lives.
+//
+//  0 fbm      One connected field over the whole sky, thresholded by
+//             coverage. Cheap and dense; at a near-horizon pitch its sheets
+//             smear into streaks converging on the vanishing point, because
+//             a shallow ray crosses tens of kilometres of the same layer.
+//  1 islands  The same field, multiplied by a gate from a much coarser read.
+//             Cloud gathers into separate masses with real sky between them,
+//             which is what breaks the streaking: a shallow ray now spends
+//             most of its length in clear air.
+//  2 puffs    No field at all. A horizontal grid of cells, one hash-placed
+//             blob in each, eroded by a noise read. Discrete clouds with
+//             gaps, and nothing periodic anywhere in it.
+//  3 billow   fBm with a Worley field remapped into it, the standard
+//             "Perlin-Worley" of production cloud renderers. Worley's level
+//             sets bulge outwards where value noise's only undulate, which
+//             is what makes a cloud look like cauliflower.
+//  4 cumulus  Billow and islands at once: the bulged field inside the gate.
+//             The most cloud-like of the field modes, and the most expensive
+//             of the five.
+// ---------------------------------------------------------------------------
+
+const ALGO_FBM: u32 = 0u;
+const ALGO_ISLANDS: u32 = 1u;
+const ALGO_PUFFS: u32 = 2u;
+const ALGO_BILLOW: u32 = 3u;
+const ALGO_CUMULUS: u32 = 4u;
+
+// Two of the modes are really one lever each, and they compose: `cumulus` is
+// `billow`'s field shape inside `islands`' gate. Asking the question this way
+// rather than with two more enum values keeps the dispatch in one place.
+fn uses_islands(algorithm: u32) -> bool {
+    return algorithm == ALGO_ISLANDS || algorithm == ALGO_CUMULUS;
+}
+
+fn uses_billow(algorithm: u32) -> bool {
+    return algorithm == ALGO_BILLOW || algorithm == ALGO_CUMULUS;
+}
+
+// --- islands ---
+// The gate is a read of the base texture at a fraction of its usual rate, so
+// it varies over tens of kilometres rather than over one cloud. At 0.14 the
+// gate's own tile is seven times the cloud tile — 73 km at the default dial,
+// past MAX_DISTANCE, so the view never holds two copies of it.
+const ISLAND_SCALE: f32 = 0.14;
+// Read from a coarse mip: the gate wants the shape of the field, not its
+// detail, and asking for mip 3 costs the same as asking for mip 0.
+const ISLAND_LOD: f32 = 3.0;
+// Width of the gate's soft edge. Too sharp and the masses have cut edges;
+// too soft and the clear sky never fully clears.
+const ISLAND_SOFT: f32 = 0.16;
+// A shift, so the gate is not reading the same corner of the texture as the
+// clouds and quietly correlating "where cloud is" with "where cloud is".
+const ISLAND_OFFSET: vec3<f32> = vec3<f32>(0.61, 0.29, 0.13);
+// Two tests in series each get `coverage` to this power, so their product is
+// the dial again. The arithmetic says 0.5; the gate's soft edge lets through
+// more than a hard test would, and the measured value that puts this mode on
+// the same sky cover as mode 0 is higher. See the calibration note in
+// CLAUDE.md.
+const ISLAND_GAMMA: f32 = 0.72;
+
+// --- puffs ---
+// Cell size, in feature sizes. One cloud per cell, so this is how far apart
+// the clouds are; the radius below is how big they are.
+const PUFF_SPACING: f32 = 1.55;
+// Blob radius, as a fraction of a cell. Above ~0.5 neighbouring clouds start
+// to merge into a mass again.
+const PUFF_RADIUS: f32 = 0.52;
+// How far a centre wanders from its cell's middle, in cells. Without this the
+// clouds sit on a visible grid.
+//
+// It is also half of what lets `puff_field` look at four cells instead of
+// nine, which is the single biggest thing in this mode's cost. The argument,
+// per axis: a centre moves at most PUFF_JITTER/2 = 0.25 cells off its own
+// centre, and any cell outside the nearest four is at least 1.0 cells away
+// along some axis, leaving 0.75 — while a blob's radius is at most
+// PUFF_RADIUS * (1 + PUFF_SIZE_VARY/2) = 0.66. 0.66 < 0.75, so the five cells
+// that are not searched provably cannot reach the sample. Raise either
+// constant past that and clouds start vanishing as you walk into them.
+const PUFF_JITTER: f32 = 0.50;
+// How much flatter than wide a cloud is. Cumulus are wider than they are
+// tall, and a sphere reads as a balloon.
+const PUFF_SQUASH: f32 = 1.9;
+// Where the blob's soft shell starts, as a fraction of its radius. The core
+// inside this is solid; from here out it falls to nothing at the surface.
+const PUFF_EDGE: f32 = 0.25;
+// Spread of sizes and heights, so a sky is not one cloud stamped out N times.
+const PUFF_SIZE_VARY: f32 = 0.55;
+const PUFF_HEIGHT_VARY: f32 = 0.35;
+// How hard the erosion noise bites into the shell. This is what turns a
+// smooth ellipsoid into something cloud-shaped; 0 leaves bare balloons.
+const PUFF_EROSION: f32 = 0.90;
+// The erosion read's tile, in feature sizes. Deliberately *not* a whole
+// multiple of PUFF_SPACING: if it were, every cloud would be eroded by the
+// same part of the texture and the sky would be one shape repeated.
+const PUFF_NOISE_SCALE: f32 = 0.6;
+// How fast a puff fades at the floor and ceiling of the slab. A puff carries
+// its own vertical shape, so this only has to stop it being cut off square.
+const PUFF_SLAB_SOFTNESS: f32 = 0.08;
+// An occupied cell is not a full cell of cloud: a blob of radius 0.52 cells,
+// eroded, covers about two thirds of it. Without this the dial would read a
+// third low against every other mode. It clamps at 1, which is the honest
+// answer — a sky of separate clouds cannot become overcast, and past about
+// 0.65 the dial stops doing anything.
+const PUFF_COVER_GAIN: f32 = 1.55;
+// The direction the cell grid runs in, as a unit vector. A square lattice
+// aligned to the world axes puts its energy on them — measured as an
+// axis_bias of 2.53, against 0.99 for the fBm field — which is the same
+// defect the warp was built to fix for the value noise. cos/sin of 31.7
+// degrees, written out rather than computed, because this is a per-sample
+// rotation and two transcendentals per sample is not free.
+const PUFF_GRID_DIR: vec2<f32> = vec2<f32>(0.85112, 0.52497);
+
+// --- billow ---
+// Worley tile relative to the cloud tile. 1.0 puts a cellular bump on about
+// every cloud; higher is bumpier.
+const BILLOW_SCALE: f32 = 1.4;
+// How far towards the remapped field to go. 0 is plain fBm, 1 all billow.
+const BILLOW_AMOUNT: f32 = 1.0;
+// The remap both lifts the field and squashes its spread — measured, mean
+// 0.675 and standard deviation 0.221 against mode 0's 0.529 and 0.292. Left
+// alone that makes the same dial a cloudier sky with softer edges, so the
+// mode could not be compared against the others at all. These three put the
+// field back on mode 0's mean and spread, which is what the histogram
+// flattening in the bake bought and what keeps the coverage dial honest.
+const BILLOW_MEAN: f32 = 0.675;
+const BILLOW_GAIN: f32 = 1.322;
+const BILLOW_TARGET: f32 = 0.529;
+
+// Four-and-four random numbers from a grid cell. One 32-bit avalanche gives
+// four usable bytes; a second round of the same mixer gives four more, which
+// is cheaper than hashing the cell twice from scratch.
+struct CellHash {
+    a: vec4<f32>,   // x,z jitter · size · exists
+    b: vec4<f32>,   // height · spare
+};
+
+fn hash_cell(c: vec2<i32>) -> CellHash {
+    var h = u32(c.x) * 0x8da6b343u + u32(c.y) * 0xd8163841u + 0x9e3779b9u;
+    // lowbias32: two multiply-and-xorshift rounds with good avalanche, so two
+    // cells one apart give completely unrelated bytes.
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    h ^= h >> 16u;
+    var g = h;
+    g ^= g >> 16u;
+    g *= 0x7feb352du;
+    g ^= g >> 15u;
+
+    var out: CellHash;
+    out.a = vec4<f32>(vec4<u32>(h, h >> 8u, h >> 16u, h >> 24u) & vec4<u32>(255u)) * (1.0 / 255.0);
+    out.b = vec4<f32>(vec4<u32>(g, g >> 8u, g >> 16u, g >> 24u) & vec4<u32>(255u)) * (1.0 / 255.0);
+    return out;
+}
+
+// The blob field: 1 deep inside a cloud, 0 in clear sky, before erosion.
+//
+// Every point is inside at most a few cells' reach, so instead of asking
+// "which clouds exist" we ask "which cells near me could hold one" — four of
+// them, because the constants are chosen so a fifth provably cannot reach.
+// The cost is four hashes and four distances, against the forty hashes a
+// five-octave fBm used to cost, and unlike a texture it has no period at all:
+// cell (10^6, 3) hashes to something unrelated to cell (0, 3).
+fn puff_field(dp: vec3<f32>) -> f32 {
+    let cell = dials.feature_size * PUFF_SPACING;
+    // Into the grid's own frame, which is rotated against the world's.
+    let g = vec2<f32>(
+        dot(dp.xz, PUFF_GRID_DIR),
+        dot(dp.xz, vec2<f32>(-PUFF_GRID_DIR.y, PUFF_GRID_DIR.x)),
+    );
+    // The four cells whose *centres* are nearest, not the four the point sits
+    // between: centres are at half-integers, so shifting by half a cell before
+    // the floor picks the right quad. See PUFF_JITTER for why four is enough.
+    let base = vec2<i32>(floor(g / cell - 0.5));
+    let thickness = CLOUD_TOP - CLOUD_BOTTOM;
+    let mid = (CLOUD_BOTTOM + CLOUD_TOP) * 0.5;
+
+    var d = 0.0;
+    for (var dz = 0; dz <= 1; dz = dz + 1) {
+        for (var dx = 0; dx <= 1; dx = dx + 1) {
+            let c = base + vec2<i32>(dx, dz);
+            let h = hash_cell(c);
+
+            // Whether this cell has a cloud in it at all — the dial, scaled
+            // by PUFF_COVER_GAIN so that the sky it ends up covering is the
+            // dial rather than the cell count being it.
+            if (h.a.w >= dials.coverage * PUFF_COVER_GAIN) {
+                continue;
+            }
+
+            // Kept in grid space, and the sample point with it, so the
+            // rotation costs one dot product per sample rather than one
+            // rotation back per cell.
+            let centre_xz = (vec2<f32>(c) + 0.5 + (h.a.xy - 0.5) * PUFF_JITTER) * cell;
+            let r = cell * PUFF_RADIUS * (1.0 + PUFF_SIZE_VARY * (h.a.z - 0.5));
+            // Clamp the vertical radius to the slab: at a 10 km feature size a
+            // blob would otherwise be taller than the layer is deep and come
+            // out as a flat-topped cylinder.
+            let ry = min(r / PUFF_SQUASH, thickness * 0.45);
+            let cy = mid + (h.b.x - 0.5) * thickness * PUFF_HEIGHT_VARY;
+
+            let v = vec3<f32>(
+                (g.x - centre_xz.x) / r,
+                (dp.y - cy) / ry,
+                (g.y - centre_xz.y) / r,
+            );
+            // `max`, not a sum: overlapping blobs should merge into one cloud
+            // rather than stack into a denser one.
+            d = max(d, 1.0 - smoothstep(PUFF_EDGE, 1.0, length(v)));
+        }
+    }
+    return d;
+}
+
+// A puff, eroded. The erosion is the whole trick: a smooth ellipsoid reads as
+// a balloon, and a noise read that eats into its shell while leaving the core
+// alone turns it into a cloud.
+fn puff_density(dp: vec3<f32>, lod: vec2<f32>, detail: bool) -> f32 {
+    let d = puff_field(dp);
+    // Nothing here: skip the fetch. Most samples in a puffy sky take this
+    // branch, which is why the mode is affordable at all.
+    if (d <= 0.0 || !detail) {
+        return d;
+    }
+
+    let tile = dials.feature_size * PUFF_NOISE_SCALE;
+    // `lod` was worked out for a tile of TILE_SCALE feature sizes. This read
+    // crosses its texture faster by that ratio, so it needs a coarser mip by
+    // the log of it, or the erosion fizzes in the distance.
+    let level = max(0.0, lod.x + log2(TILE_SCALE / PUFF_NOISE_SCALE));
+    let n = textureSampleLevel(noise_base, noise_sampler, dp / tile, level).r;
+
+    // Bite into the shell: rescaling by what is left keeps a solid core solid
+    // instead of thinning the whole cloud towards transparent.
+    let bite = (1.0 - n) * PUFF_EROSION;
+    return clamp((d - bite) / max(1.0 - bite, 0.001), 0.0, 1.0);
+}
+
+// Perlin-Worley. `n` is the value-noise field; this remaps it so that where a
+// Worley feature point sits (w near 0) the floor is lifted and the field
+// bulges outwards, and far from one (w near 1) it is left alone.
+//
+// remap(n, w - 1, 1, 0, 1) is the form it is usually written in: rescale n
+// from the range [w-1, 1] onto [0, 1].
+fn billow_value(q: vec3<f32>, n: f32, lod: f32, detail: bool) -> f32 {
+    if (!detail && !BILLOW_IN_SHADOW) {
+        return n;
+    }
+    // The Worley texture is half the base's resolution, so its voxels are
+    // twice as big and it wants one mip level coarser for the same step.
+    let level = max(0.0, lod - 1.0 + log2(BILLOW_SCALE));
+    let w = textureSampleLevel(noise_worley, noise_sampler, q * BILLOW_SCALE, level).r;
+    let pw = (n - (w - 1.0)) / (2.0 - w);
+    let normalised = BILLOW_TARGET + (pw - BILLOW_MEAN) * BILLOW_GAIN;
+    return clamp(mix(n, normalised, BILLOW_AMOUNT), 0.0, 1.0);
+}
+
+// How much cloud the field itself is asked for, once the gate has taken its
+// share. Both tests get the dial to the same power, so their product is the
+// dial again.
+fn island_cover() -> f32 {
+    return pow(dials.coverage, ISLAND_GAMMA);
+}
+
+// The gate for one view sample, worked out once and handed to every step of
+// the shadow march that sample spawns. The same bargain as WARP_SHARED_SHADOW:
+// the gate varies over tens of kilometres and the shadow march walks one, so
+// the value it would compute for itself is the one it was given. Off the view
+// ray it is 1.0, which is what the other three algorithms want anyway.
+fn shared_gate(drifted: vec3<f32>, warp: vec3<f32>, tile: f32) -> f32 {
+    if (!uses_islands(dials.algorithm)) {
+        return 1.0;
+    }
+    return island_gate((drifted + warp) / tile, island_cover());
+}
+
+// The gate that turns an even wash of cloud into separate masses.
+//
+// Returned in 0..1, averaging `cover`: the base texture's histogram was
+// flattened by the bake, so the fraction of it above `1 - cover` is `cover`
+// itself, and a smoothstep centred there keeps that average while softening
+// the edge.
+fn island_gate(q: vec3<f32>, cover: f32) -> f32 {
+    let m = textureSampleLevel(
+        noise_base, noise_sampler, q * ISLAND_SCALE + ISLAND_OFFSET, ISLAND_LOD
+    ).r;
+    let t = 1.0 - cover;
+    return smoothstep(t - ISLAND_SOFT, t + ISLAND_SOFT, m);
+}
+
 // Density of the cloud medium at a world-space point.
-fn cloud_density_at(p: vec3<f32>, lod: vec2<f32>, detail: bool, warp: vec3<f32>) -> f32 {
+//
+// The four algorithms differ only here. Each returns a density in 0..1 before
+// the overall DENSITY multiplier: what the march integrates is the same shape
+// of number whichever one is selected.
+fn cloud_density_at(
+    p: vec3<f32>,
+    lod: vec2<f32>,
+    detail: bool,
+    warp: vec3<f32>,
+    gate: f32,     // the islands gate from `shared_gate`; 1.0 for every other mode
+) -> f32 {
     // Height through the layer, 0 at the bottom and 1 at the top.
     let h = (p.y - CLOUD_BOTTOM) / (CLOUD_TOP - CLOUD_BOTTOM);
     if (h < 0.0 || h > 1.0) {
         return 0.0;
+    }
+
+    // Scroll the noise field to make the clouds drift. Moving the *sample
+    // point* against the wind is the same as moving the clouds with it.
+    let tile = dials.feature_size * TILE_SCALE;
+    let drifted = p + WIND * u.time;
+
+    if (dials.algorithm == ALGO_PUFFS) {
+        // A puff already has a top and a bottom of its own, so the slab only
+        // has to stop one hanging out of the layer. The flat-based profile
+        // the field modes use would slice every blob off at the knees.
+        let slab = smoothstep(0.0, PUFF_SLAB_SOFTNESS, h)
+                 * (1.0 - smoothstep(1.0 - PUFF_SLAB_SOFTNESS, 1.0, h));
+        return puff_density(drifted, lod, detail) * slab * DENSITY;
     }
 
     // Vertical profile: clouds have a flattish base and a soft, rounded top,
@@ -478,13 +813,8 @@ fn cloud_density_at(p: vec3<f32>, lod: vec2<f32>, detail: bool, warp: vec3<f32>)
     let profile = smoothstep(0.0, CLOUD_BASE_SOFTNESS, h)
                 * (1.0 - smoothstep(CLOUD_TOP_SOFTNESS, 1.0, h));
 
-    // Scroll the noise field to make the clouds drift. Moving the *sample
-    // point* against the wind is the same as moving the clouds with it.
-    let tile = dials.feature_size * TILE_SCALE;
-    let drifted = p + WIND * u.time;
     let q = (drifted + warp) / tile;
-
-    let n = cloud_noise(q, lod, detail);
+    var n = cloud_noise(q, lod, detail);
 
     // Coverage: everything below the threshold becomes clear sky, and what
     // remains is rescaled back to [0,1] so the clouds keep their full density
@@ -492,7 +822,20 @@ fn cloud_density_at(p: vec3<f32>, lod: vec2<f32>, detail: bool, warp: vec3<f32>)
     //
     // The bake flattened the field's histogram, so this dial is close to
     // literal: 0.45 means about 45% of the layer is above the threshold.
-    var threshold = 1.0 - dials.coverage;
+    // Two independent tests have to pass for a point to be cloud in `islands`,
+    // so the sky it covers is the product of the two. Giving each a root of
+    // the dial makes that product the dial again — the mode changes where the
+    // cloud is, not how much of it there is.
+    var cover = dials.coverage;
+
+    if (uses_islands(dials.algorithm)) {
+        cover = island_cover();
+    }
+    if (uses_billow(dials.algorithm)) {
+        n = billow_value(q, n, lod.x, detail);
+    }
+
+    var threshold = 1.0 - cover;
 
     // Weather: a coarse read of the same texture nudges that threshold up and
     // down across the sky. Centred on zero, so the dial keeps the meaning the
@@ -502,14 +845,14 @@ fn cloud_density_at(p: vec3<f32>, lod: vec2<f32>, detail: bool, warp: vec3<f32>)
         threshold += (w - 0.5) * WEATHER_AMOUNT;
     }
 
-    let shaped = clamp((n - threshold) / max(dials.coverage, 0.001), 0.0, 1.0);
+    let shaped = clamp((n - threshold) / max(cover, 0.001), 0.0, 1.0);
 
-    return shaped * profile * DENSITY;
+    return shaped * gate * profile * DENSITY;
 }
 
 // The view ray wants every bit of detail the step length can carry.
-fn cloud_density(p: vec3<f32>, lod: vec2<f32>, warp: vec3<f32>) -> f32 {
-    return cloud_density_at(p, lod, true, warp);
+fn cloud_density(p: vec3<f32>, lod: vec2<f32>, warp: vec3<f32>, gate: f32) -> f32 {
+    return cloud_density_at(p, lod, true, warp, gate);
 }
 
 // ---------------------------------------------------------------------------
@@ -541,7 +884,7 @@ fn cloud_phase(cos_theta: f32) -> f32 {
 // get longer as they go, because distant blockers matter less than nearby
 // ones and this buys depth cheaply. Six steps is enough to read as shadowing.
 // These samples skip the detail texture: see `cloud_noise`.
-fn light_march(p: vec3<f32>, lod: vec2<f32>, warp: vec3<f32>, tile: f32) -> f32 {
+fn light_march(p: vec3<f32>, lod: vec2<f32>, warp: vec3<f32>, tile: f32, gate: f32) -> f32 {
     var optical_depth = 0.0;
     var t = 0.0;
     var step = LIGHT_STEP_SIZE;
@@ -555,7 +898,7 @@ fn light_march(p: vec3<f32>, lod: vec2<f32>, warp: vec3<f32>, tile: f32) -> f32 
         if (!WARP_SHARED_SHADOW) {
             w = warp_at(sp + WIND * u.time, tile);
         }
-        optical_depth += cloud_density_at(sp, lod, false, w) * step;
+        optical_depth += cloud_density_at(sp, lod, false, w, gate) * step;
         t += step;
         step *= LIGHT_STEP_GROWTH;
     }
@@ -621,8 +964,15 @@ fn march_clouds(
         let t = hit.x + (f32(i) + offset) * dt;
         let p = origin + dir * t;
 
-        let warp = warp_at(p + WIND * u.time, tile);
-        let density = cloud_density(p, lod, warp);
+        // The puff grid has no period to break, so it has no use for the
+        // warp's transcendentals either.
+        let drifted = p + WIND * u.time;
+        var warp = vec3<f32>(0.0);
+        if (dials.algorithm != ALGO_PUFFS) {
+            warp = warp_at(drifted, tile);
+        }
+        let gate = shared_gate(drifted, warp, tile);
+        let density = cloud_density(p, lod, warp, gate);
         if (density <= 0.0) {
             continue;
         }
@@ -631,7 +981,7 @@ fn march_clouds(
         let step_transmittance = exp(-sigma * dt);
 
         // How much sun reaches this point through the cloud above it.
-        let sun_visibility = light_march(p, light_lod, warp, tile);
+        let sun_visibility = light_march(p, light_lod, warp, tile, gate);
         let sunlight = SUN_LIGHT * SUN_LIGHT_INTENSITY * sun_visibility * phase;
 
         // Skylight, dimmed towards the base where less of the dome is visible.
@@ -689,14 +1039,30 @@ fn fs_field(in: VsOut) -> @location(0) vec4<f32> {
     // particular march step length would make of it.
     let lod = vec2<f32>(0.0, 0.0);
 
-    let warp = warp_at(p + WIND * u.time, tile);
-    let full = cloud_density_at(p, lod, true, warp);
-    let base = cloud_density_at(p, lod, false, warp);
+    var warp = vec3<f32>(0.0);
+    if (dials.algorithm != ALGO_PUFFS) {
+        warp = warp_at(p + WIND * u.time, tile);
+    }
+    let gate = shared_gate(p + WIND * u.time, warp, tile);
+    let full = cloud_density_at(p, lod, true, warp, gate);
+    let base = cloud_density_at(p, lod, false, warp, gate);
 
     // The raw field, before the coverage threshold. That threshold is a hard
     // nonlinearity and manufactures harmonics of its own, so the honest input
-    // to a spectrum is the field itself.
-    let raw = cloud_noise((p + WIND * u.time + warp) / tile, lod, true);
+    // to a spectrum is the field itself. Which field that is depends on the
+    // algorithm: for puffs it is the blob placement before erosion, which is
+    // the thing whose repetition the metric is asking about.
+    let drifted = p + WIND * u.time;
+    var raw = 0.0;
+    if (dials.algorithm == ALGO_PUFFS) {
+        raw = puff_field(drifted);
+    } else {
+        let q = (drifted + warp) / tile;
+        raw = cloud_noise(q, lod, true);
+        if (uses_billow(dials.algorithm)) {
+            raw = billow_value(q, raw, lod.x, true);
+        }
+    }
 
     return vec4<f32>(full, base, raw, 1.0);
 }

@@ -133,6 +133,13 @@ fn parse_args() -> Result<Args> {
                 let v = it.next().context("--exposure needs a number (0.1..4)")?;
                 args.params.exposure = v.parse().with_context(|| format!("bad --exposure: {v}"))?;
             }
+            "--algorithm" | "--algo" => {
+                let v = it.next().context("--algorithm needs a name")?;
+                let a = params::Algorithm::from_name(&v).with_context(|| {
+                    format!("unknown algorithm {v:?}; try one of: {}", params::Algorithm::names())
+                })?;
+                args.params.algorithm = a as u32;
+            }
             "--def" => {
                 let v = it.next().context("--def needs NAME=VALUE")?;
                 args.defines.push_arg(&v)?;
@@ -158,6 +165,7 @@ fn parse_args() -> Result<Args> {
                                                      (repeatable; the file on disk is untouched)\n\
                      \n\
                      The four live dials. In a window these set where the sliders start:\n\
+                     --algorithm <name>              density field: fbm, islands, puffs, billow, cumulus\n\
                      --coverage <0..1>               how much of the sky is cloud\n\
                      --feature-size <metres>         how big the clouds are\n\
                      --shadow <0..2>                 self-shadowing strength\n\

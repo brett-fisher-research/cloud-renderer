@@ -29,7 +29,7 @@ pub struct Renderer {
     /// Tiling 3D noise, baked once at startup. Keeps the textures alive for
     /// as long as the bind group that references them.
     #[allow(dead_code)]
-    noise_textures: (wgpu::Texture, wgpu::Texture),
+    noise_textures: (wgpu::Texture, wgpu::Texture, wgpu::Texture),
     /// Format of whatever we draw into (swapchain texture, or offscreen RGBA).
     target_format: wgpu::TextureFormat,
     shader_path: PathBuf,
@@ -106,8 +106,16 @@ impl Renderer {
         );
         let noise_detail =
             noise::bake_fbm(device, &gpu.queue, "noise detail", 64, &[0.5, 0.25, 0.125, 0.0625]);
+        // Cellular noise, for the `billow` and `puffs` algorithms. Half the
+        // resolution of the base field: it is all rounded bumps with no fine
+        // detail in it, so there is nothing for the extra voxels to carry.
+        // Four cells across the tile matches the base field's loudest octave,
+        // so a bump is about the size of a cloud.
+        let noise_worley =
+            noise::bake_worley(device, &gpu.queue, "noise worley", 128, 4, &[0.625, 0.25, 0.125]);
         let base_view = noise_base.create_view(&wgpu::TextureViewDescriptor::default());
         let detail_view = noise_detail.create_view(&wgpu::TextureViewDescriptor::default());
+        let worley_view = noise_worley.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Repeat addressing is what makes one 128-voxel cube cover the whole
         // sky: sample coordinates outside 0..1 wrap back around.
@@ -140,6 +148,7 @@ impl Renderer {
                 uniform_entry(1),
                 texture_entry(2),
                 texture_entry(3),
+                texture_entry(5),
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -173,6 +182,10 @@ impl Renderer {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&noise_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&worley_view),
+                },
             ],
         });
 
@@ -204,7 +217,7 @@ impl Renderer {
             bind_group_layout,
             pipeline_layout,
             pipeline,
-            noise_textures: (noise_base, noise_detail),
+            noise_textures: (noise_base, noise_detail, noise_worley),
             target_format,
             shader_path,
             defines: defines.clone(),
@@ -247,7 +260,7 @@ impl Renderer {
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
     }
 
-    /// Upload the cloud dials. Cheap enough (16 bytes) to send every frame
+    /// Upload the cloud dials. Cheap enough (32 bytes) to send every frame
     /// rather than tracking whether a slider actually moved.
     pub fn update_params(&self, gpu: &Gpu, params: &Params) {
         gpu.queue

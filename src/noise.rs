@@ -130,6 +130,29 @@ pub fn bake_fbm(
     // ordinary 2D texture strikes when it recedes into the distance.
     let mips = mip_chain(data, size);
 
+    let texture = upload_3d(device, queue, label, size, &mips);
+
+    log::info!(
+        "baked {label}: {size}^3, {} octaves, {} mips, {:.0} KiB, {:.0} ms on {threads} threads",
+        amplitudes.len(),
+        mips.len(),
+        mips.iter().map(Vec::len).sum::<usize>() as f32 / 1024.0,
+        started.elapsed().as_secs_f32() * 1000.0
+    );
+    texture
+}
+
+/// Create a 3D texture and upload every mip level of a baked field into it.
+///
+/// Shared by both bakes: the only thing that differs between a value-noise
+/// field and a Worley one is how the voxels were computed.
+fn upload_3d(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    size: u32,
+    mips: &[Vec<u8>],
+) -> wgpu::Texture {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -144,7 +167,7 @@ pub fn bake_fbm(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let mut uploaded = 0usize;
+
     for (level, voxels) in mips.iter().enumerate() {
         let extent = (size >> level).max(1);
         queue.write_texture(
@@ -166,16 +189,7 @@ pub fn bake_fbm(
                 depth_or_array_layers: extent,
             },
         );
-        uploaded += voxels.len();
     }
-
-    log::info!(
-        "baked {label}: {size}^3, {} octaves, {} mips, {:.0} KiB, {:.0} ms on {threads} threads",
-        amplitudes.len(),
-        mips.len(),
-        uploaded as f32 / 1024.0,
-        started.elapsed().as_secs_f32() * 1000.0
-    );
     texture
 }
 
@@ -269,4 +283,152 @@ fn bake_slab(out: &mut [u8], z0: usize, size: u32, amplitudes: &[f32]) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Worley (cellular) noise
+//
+//  Value noise answers "what is the smooth random number here". Worley asks a
+//  different question: scatter one feature point per cell of a lattice, then
+//  return the distance to the nearest one. Near a point the field is 0 and it
+//  rises away from it, so *inverting* it gives a field of rounded bumps — and
+//  a stack of those at several scales is the cauliflower surface that reads as
+//  a cumulus cloud. Value-noise fBm cannot make that shape: its level sets are
+//  smooth blobs, not bulges.
+//
+//  It tiles for the same reason the value noise does: cell indices wrap modulo
+//  the octave's cell count, so the far face of the cube meets the near one.
+// ---------------------------------------------------------------------------
+
+/// One feature point per cell, laid out so cell (x,y,z) is at index
+/// `(z * cells + y) * cells + x`. Positions are in tile units, 0..1.
+fn feature_points(cells: u32, salt: u32) -> Vec<[f32; 3]> {
+    let n = cells as usize;
+    let mut points = Vec::with_capacity(n * n * n);
+    for z in 0..cells {
+        for y in 0..cells {
+            for x in 0..cells {
+                // Three decorrelated hashes of the same cell, one per axis.
+                let jx = hash(x.wrapping_add(salt), y, z);
+                let jy = hash(x, y.wrapping_add(salt ^ 0x9e37_79b9), z);
+                let jz = hash(x, y, z.wrapping_add(salt ^ 0x85eb_ca6b));
+                points.push([
+                    (x as f32 + jx) / cells as f32,
+                    (y as f32 + jy) / cells as f32,
+                    (z as f32 + jz) / cells as f32,
+                ]);
+            }
+        }
+    }
+    points
+}
+
+/// Distance from `p` (tile units) to the nearest feature point, scaled so 1.0
+/// is roughly a whole cell. Searches the 27 cells around `p`, which is enough:
+/// no point can be closer than one that lies outside them.
+fn worley(p: [f32; 3], cells: u32, points: &[[f32; 3]]) -> f32 {
+    let c = cells as i32;
+    let base = [
+        (p[0] * cells as f32).floor() as i32,
+        (p[1] * cells as f32).floor() as i32,
+        (p[2] * cells as f32).floor() as i32,
+    ];
+
+    let mut best = f32::MAX;
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let ix = (base[0] + dx).rem_euclid(c);
+                let iy = (base[1] + dy).rem_euclid(c);
+                let iz = (base[2] + dz).rem_euclid(c);
+                let q = points[((iz * c + iy) * c + ix) as usize];
+                // The neighbour may have wrapped to the far side of the tile;
+                // take the shortest way round on each axis.
+                let mut d2 = 0.0;
+                for axis in 0..3 {
+                    let mut d = q[axis] - p[axis];
+                    if d > 0.5 {
+                        d -= 1.0;
+                    } else if d < -0.5 {
+                        d += 1.0;
+                    }
+                    d2 += d * d;
+                }
+                best = best.min(d2);
+            }
+        }
+    }
+    (best.sqrt() * cells as f32).min(1.0)
+}
+
+/// Bake a tiling stack of Worley octaves, cell counts doubling from `cells`.
+///
+/// Stored as the *distance* field, 0 on a feature point and 1 far from one,
+/// because that is the form the shader's Perlin-Worley remap wants. The same
+/// histogram flattening as [`bake_fbm`] is applied, so a threshold against it
+/// means roughly what it says.
+pub fn bake_worley(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    size: u32,
+    cells: u32,
+    amplitudes: &[f32],
+) -> wgpu::Texture {
+    let started = std::time::Instant::now();
+    let n = size as usize;
+    let mut data = vec![0u8; n * n * n];
+
+    // Hashing a cell is the same work for every voxel that falls in it, so the
+    // feature points are laid out once per octave rather than per sample.
+    let octaves: Vec<(u32, Vec<[f32; 3]>, f32)> = amplitudes
+        .iter()
+        .enumerate()
+        .map(|(i, &a)| {
+            let c = cells << i;
+            (c, feature_points(c, 0x51_u32.wrapping_mul(i as u32 + 1)), a)
+        })
+        .collect();
+    let norm: f32 = amplitudes.iter().sum();
+
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(4)
+        .min(n);
+    let slice = n * n;
+    let octaves = &octaves;
+    std::thread::scope(|scope| {
+        for (t, chunk) in data.chunks_mut(slice * n.div_ceil(threads)).enumerate() {
+            let z0 = t * n.div_ceil(threads);
+            scope.spawn(move || {
+                for (i, voxel) in chunk.iter_mut().enumerate() {
+                    let z = z0 + i / (n * n);
+                    let y = (i / n) % n;
+                    let x = i % n;
+                    let p = [
+                        (x as f32 + 0.5) / size as f32,
+                        (y as f32 + 0.5) / size as f32,
+                        (z as f32 + 0.5) / size as f32,
+                    ];
+                    let mut total = 0.0;
+                    for (c, points, amplitude) in octaves.iter() {
+                        total += amplitude * worley(p, *c, points);
+                    }
+                    *voxel = ((total / norm).clamp(0.0, 1.0) * 255.0) as u8;
+                }
+            });
+        }
+    });
+
+    equalise(&mut data);
+    let mips = mip_chain(data, size);
+    let texture = upload_3d(device, queue, label, size, &mips);
+
+    log::info!(
+        "baked {label}: {size}^3, {} worley octaves from {cells} cells, {} mips, {:.0} ms",
+        amplitudes.len(),
+        mips.len(),
+        started.elapsed().as_secs_f32() * 1000.0
+    );
+    texture
 }

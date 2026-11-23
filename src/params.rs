@@ -15,9 +15,11 @@ use bytemuck::{Pod, Zeroable};
 
 /// Matches `struct Params` in `shaders/clouds.wgsl`.
 ///
-/// Four `f32`s is exactly 16 bytes, which is also the minimum size and the
-/// alignment WGSL wants for a uniform block, so no padding is needed. Adding a
-/// fifth field means adding three more to keep that true.
+/// A uniform block is a multiple of 16 bytes, so these come in fours. The
+/// first four `f32`s filled the first sixteen exactly; `algorithm` opened a
+/// second row, and the three `_pad` slots are the rest of it. They are spare
+/// dials waiting to happen — a fifth real one costs nothing until there are
+/// four of them.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Params {
@@ -33,6 +35,11 @@ pub struct Params {
     pub shadow_strength: f32,
     /// Overall brightness multiplier, applied just before tone mapping.
     pub exposure: f32,
+    /// Which density field to build the clouds from: an [`Algorithm`] as a
+    /// plain `u32`, because that is what crosses into the shader.
+    pub algorithm: u32,
+    /// Unused; see the note on the struct.
+    pub _pad: [f32; 3],
 }
 
 impl Default for Params {
@@ -42,6 +49,8 @@ impl Default for Params {
             feature_size: 2600.0,
             shadow_strength: 0.60,
             exposure: 1.0,
+            algorithm: Algorithm::Fbm as u32,
+            _pad: [0.0; 3],
         }
     }
 }
@@ -63,4 +72,100 @@ impl Params {
     pub const FEATURE_SIZE_RANGE: std::ops::RangeInclusive<f32> = 300.0..=10000.0;
     pub const SHADOW_STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
     pub const EXPOSURE_RANGE: std::ops::RangeInclusive<f32> = 0.1..=4.0;
+
+    pub fn algorithm(&self) -> Algorithm {
+        Algorithm::from(self.algorithm)
+    }
 }
+
+/// Which density field the clouds are built from.
+///
+/// Every mode marches the same slab with the same lighting, aerial perspective
+/// and tone mapping. The only thing that changes is the function answering
+/// "how much cloud is at this point", which is where the *look* of a cloud
+/// renderer actually lives — so this is the one knob worth being able to flip
+/// between while the program runs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum Algorithm {
+    /// Thresholded fBm over the whole slab: one connected field everywhere.
+    #[default]
+    Fbm = 0,
+    /// The same field, gated by a much coarser one so cloud gathers into
+    /// separate masses with real clear sky between them.
+    Islands = 1,
+    /// No field at all: one blob per cell of a horizontal grid, placed and
+    /// sized by a hash, then eroded by noise. Discrete clouds, no repeat.
+    Puffs = 2,
+    /// Perlin-Worley: the fBm with a cellular field remapped into it, which
+    /// is what gives clouds cauliflower bulges rather than smooth lumps.
+    Billow = 3,
+    /// Billow inside the islands gate: cauliflower masses with sky between.
+    Cumulus = 4,
+}
+
+impl Algorithm {
+    pub const ALL: [Algorithm; 5] = [
+        Algorithm::Fbm,
+        Algorithm::Islands,
+        Algorithm::Puffs,
+        Algorithm::Billow,
+        Algorithm::Cumulus,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Algorithm::Fbm => "fbm",
+            Algorithm::Islands => "islands",
+            Algorithm::Puffs => "puffs",
+            Algorithm::Billow => "billow",
+            Algorithm::Cumulus => "cumulus",
+        }
+    }
+
+    /// One line for the panel's tooltip and for `--help`.
+    pub fn help(self) -> &'static str {
+        match self {
+            Algorithm::Fbm => "Thresholded fBm: one connected field over the whole sky.",
+            Algorithm::Islands => {
+                "fBm gated by a coarse mask: cloud gathers into separate masses \
+                 with clear sky between."
+            }
+            Algorithm::Puffs => {
+                "Hash-placed blobs on a grid, eroded by noise: discrete clouds, \
+                 no field and no repeat."
+            }
+            Algorithm::Billow => {
+                "Perlin-Worley: a cellular field remapped into the fBm, for \
+                 cauliflower bulges."
+            }
+            Algorithm::Cumulus => {
+                "Billow inside the islands gate: cauliflower masses with real \
+                 sky between them."
+            }
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.name() == s)
+    }
+
+    /// Every name, for error messages and `--help`.
+    pub fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(|a| a.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl From<u32> for Algorithm {
+    fn from(v: u32) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|a| *a as u32 == v)
+            .unwrap_or(Algorithm::Fbm)
+    }
+}
+

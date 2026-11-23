@@ -14,6 +14,7 @@ another is not a win.
 
   tools/lab run baseline                     measure the tree as it stands
   tools/lab run steps-128 --def PRIMARY_STEPS=128
+  tools/lab run puffs --algo puffs           measure one of the density algorithms
   tools/lab noise-floor                      how much does --bench wobble?
   tools/lab report                           the quality/cost frontier so far
 
@@ -70,6 +71,13 @@ SCENES = [
 # feature size here does not change what the metric sees.
 FIELD_DIALS = ["--coverage", "0.60", "--feature-size", "2600"]
 
+# `--algo NAME` on a run applies to every scene and to the field dump, so a
+# whole matrix can be measured against one density algorithm. It is a global
+# rather than an argument threaded through because every call site wants it:
+# a row that mixed one algorithm's timing with another's picture would be
+# worse than useless.
+ALGO: list[str] = []
+
 BENCH_RE = re.compile(
     r"gpu median\s+([\d.]+) ms.*?min\s+([\d.]+)\s+p95\s+([\d.]+)\s+mean\s+([\d.]+)"
 )
@@ -100,7 +108,7 @@ def build() -> None:
 
 
 def bench(flags: list[str], defs: list[str], res: str, frames: int = 48) -> dict:
-    cmd = [str(BIN), "--bench", "--size", res, "--bench-frames", str(frames), *flags]
+    cmd = [str(BIN), "--bench", "--size", res, "--bench-frames", str(frames), *flags, *ALGO]
     for d in defs:
         cmd += ["--def", d]
     p = run(cmd)
@@ -125,7 +133,7 @@ def shoot(path: Path, flags: list[str], defs: list[str], extra: list[str] = ()) 
     frames and made them unusable against a reference rendered at either size.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [str(BIN), "--screenshot", str(path), "--size", BUDGET_RES, *flags, *extra]
+    cmd = [str(BIN), "--screenshot", str(path), "--size", BUDGET_RES, *flags, *extra, *ALGO]
     for d in defs:
         cmd += ["--def", d]
     p = run(cmd)
@@ -135,7 +143,7 @@ def shoot(path: Path, flags: list[str], defs: list[str], extra: list[str] = ()) 
 
 def dump_field(path: Path, defs: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [str(BIN), "--dump-field", str(path), *FIELD_DIALS]
+    cmd = [str(BIN), "--dump-field", str(path), *FIELD_DIALS, *ALGO]
     for d in defs:
         cmd += ["--def", d]
     p = run(cmd)
@@ -178,11 +186,15 @@ def load() -> list[dict]:
 def cmd_run(argv: list[str]) -> int:
     if not argv:
         die('run needs a config name, e.g. tools/lab run baseline --def TILE_SCALE=6.0')
-    name, defs, note, frames = argv[0], [], "", 48
+    global ALGO
+    name, defs, note, frames, algo = argv[0], [], "", 48, ""
     i = 1
     while i < len(argv):
         a = argv[i]
-        if a == "--def":
+        if a in ("--algo", "--algorithm"):
+            i += 1
+            algo = argv[i]
+        elif a == "--def":
             i += 1
             defs.append(argv[i])
         elif a == "--note":
@@ -194,6 +206,8 @@ def cmd_run(argv: list[str]) -> int:
         else:
             die(f"unknown option {a}")
         i += 1
+
+    ALGO = ["--algorithm", algo] if algo else []
 
     build()
     rev, is_dirty = git_rev(), dirty()
@@ -213,6 +227,7 @@ def cmd_run(argv: list[str]) -> int:
     field["acorr_lag_px"] = fieldstat(field_png, "base")["acorr_lag_px"]
 
     print(f"\n{name}  ({rev}{'+dirty' if is_dirty else ''})"
+          f"{'  algo: ' + algo if algo else ''}"
           f"{'  defs: ' + ','.join(defs) if defs else ''}")
     print(f"  field: tile_lock {field['base_tile_lock']:.3f}  "
           f"acorr {field['base_acorr_peak']:.3f}  axis {field['base_axis_bias']:.2f}"
@@ -233,7 +248,7 @@ def cmd_run(argv: list[str]) -> int:
               f"{'OVER' if over else 'ok':>5}")
         append({
             "ts": stamp, "config": name, "note": note, "git": rev, "dirty": is_dirty,
-            "defs": defs, "scene": scene, "res": BUDGET_RES, "frames": frames,
+            "defs": defs, "algo": algo, "scene": scene, "res": BUDGET_RES, "frames": frames,
             **perf, **field, **img,
             "shot": str(shot.relative_to(ROOT)),
             "field_png": str(field_png.relative_to(ROOT)),
