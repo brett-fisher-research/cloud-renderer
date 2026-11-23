@@ -39,6 +39,11 @@ pub struct App {
     camera: Camera,
     /// The four live cloud dials, driven by the on-screen panel.
     params: Params,
+    /// Starting window size in real pixels. Resizing the window afterwards
+    /// just reconfigures the surface, so this is only where it begins.
+    size: (u32, u32),
+    /// Skip the window size and fill the monitor instead.
+    fullscreen: bool,
     start: Instant,
 
     // Input state.
@@ -61,6 +66,8 @@ impl App {
             vsync: true,
             camera: Camera::default(),
             params: Params::default(),
+            size: (1280, 720),
+            fullscreen: false,
             start: Instant::now(),
             dragging: false,
             last_cursor: None,
@@ -72,7 +79,7 @@ impl App {
         }
     }
 
-    pub fn run(vsync: bool, params: Params) -> Result<()> {
+    pub fn run(vsync: bool, params: Params, size: (u32, u32), fullscreen: bool) -> Result<()> {
         let event_loop = EventLoop::new().context("failed to create event loop")?;
         // Poll (rather than Wait) so we render continuously — the clouds drift
         // even when there is no input.
@@ -80,6 +87,8 @@ impl App {
         let mut app = Self::new();
         app.vsync = vsync;
         app.params = params;
+        app.size = size;
+        app.fullscreen = fullscreen;
         event_loop.run_app(&mut app).context("event loop failed")?;
         Ok(())
     }
@@ -200,9 +209,16 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let attrs = Window::default_attributes()
+        // PhysicalSize, not LogicalSize: --size should mean the pixel count the
+        // fragment shader actually has to fill, not a DPI-scaled number.
+        let mut attrs = Window::default_attributes()
             .with_title("cloud-renderer — starting...")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+            .with_inner_size(winit::dpi::PhysicalSize::new(self.size.0, self.size.1));
+        if self.fullscreen {
+            // Borderless(None) = the monitor the window lands on, at its
+            // current mode, so there is no mode switch to wait for.
+            attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
         let window = Arc::new(
             event_loop
                 .create_window(attrs)

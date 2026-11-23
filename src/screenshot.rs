@@ -9,14 +9,13 @@ use crate::gpu::{create_instance, Gpu};
 use crate::params::Params;
 use crate::renderer::Renderer;
 
-pub const WIDTH: u32 = 1280;
-pub const HEIGHT: u32 = 720;
-
 /// Same colour space as the window swapchain, so the PNG matches what the
 /// window shows: the GPU applies linear -> sRGB encoding on write for us.
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 pub struct ShotOptions {
+    pub width: u32,
+    pub height: u32,
     pub time: f32,
     pub sun_elevation: Option<f32>,
     pub yaw: Option<f32>,
@@ -25,7 +24,8 @@ pub struct ShotOptions {
 }
 
 pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
-    log::info!("headless render {WIDTH}x{HEIGHT} -> {path}");
+    let (width, height) = (opts.width, opts.height);
+    log::info!("headless render {width}x{height} -> {path}");
 
     let gpu = Gpu::new(create_instance(), None)?;
     let renderer = Renderer::new(&gpu, FORMAT)?;
@@ -33,8 +33,8 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("screenshot target"),
         size: wgpu::Extent3d {
-            width: WIDTH,
-            height: HEIGHT,
+            width: width,
+            height: height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -71,18 +71,18 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
         opts.params.shadow_strength,
         opts.params.exposure
     );
-    renderer.update(&gpu, &camera.uniforms(WIDTH, HEIGHT, opts.time));
+    renderer.update(&gpu, &camera.uniforms(width, height, opts.time));
     renderer.update_params(&gpu, &opts.params);
 
     // GPU texture rows must start on a 256-byte boundary when copied to a
     // buffer, so the readback buffer may be wider than the image itself.
-    let unpadded_bytes_per_row = WIDTH * 4;
+    let unpadded_bytes_per_row = width * 4;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
 
     let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("screenshot readback"),
-        size: (padded_bytes_per_row * HEIGHT) as u64,
+        size: (padded_bytes_per_row * height) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -107,12 +107,12 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(padded_bytes_per_row),
-                rows_per_image: Some(HEIGHT),
+                rows_per_image: Some(height),
             },
         },
         wgpu::Extent3d {
-            width: WIDTH,
-            height: HEIGHT,
+            width: width,
+            height: height,
             depth_or_array_layers: 1,
         },
     );
@@ -132,13 +132,13 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
         .context("failed to map readback buffer")?;
 
     // Strip the row padding back out into a tight RGBA image.
-    let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * HEIGHT) as usize);
+    let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
     {
         let mapped = readback
             .slice(..)
             .get_mapped_range()
             .map_err(|e| anyhow::anyhow!("could not read mapped range: {e}"))?;
-        for row in 0..HEIGHT {
+        for row in 0..height {
             let start = (row * padded_bytes_per_row) as usize;
             let end = start + unpadded_bytes_per_row as usize;
             pixels.extend_from_slice(&mapped[start..end]);
@@ -146,7 +146,7 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
     }
     readback.unmap();
 
-    image::save_buffer(path, &pixels, WIDTH, HEIGHT, image::ColorType::Rgba8)
+    image::save_buffer(path, &pixels, width, height, image::ColorType::Rgba8)
         .with_context(|| format!("failed to write {path}"))?;
 
     log::info!("wrote {path}");

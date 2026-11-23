@@ -63,9 +63,14 @@ The fragment shader, per pixel:
 ## Running it
 
 ```sh
-cargo run --release                   # open a window
-cargo run --release -- --no-vsync     # uncapped, for benchmarking
+cargo run --release                        # open a window at 1920x1080
+cargo run --release -- --size 2560x1440    # any size, in real pixels
+cargo run --release -- --fullscreen        # borderless, at the monitor's resolution
+cargo run --release -- --no-vsync          # uncapped, for benchmarking
 ```
+
+The window starts at 1920x1080 and can be dragged to any size; the surface is reconfigured on
+resize, so the shader always fills whatever the window currently is.
 
 Controls: drag the mouse to look around, shift-drag to swing the sun around the compass, scroll to
 raise or lower the sun, Esc to quit. The title bar shows frame rate, resolution and sun elevation;
@@ -82,8 +87,9 @@ compile, the error prints with the offending line and the last working version k
 
 ### Screenshots
 
-Headless mode renders one frame at 1280x720 and exits, with no window. Use it to check visual
-changes without needing someone at the keyboard.
+Headless mode renders one frame at 1920x1080 and exits, with no window. `--size` applies here
+too, so `--size 3840x2160` gives a 4K still of a scene that would not run at that size. Use it to
+check visual changes without needing someone at the keyboard.
 
 ```sh
 cargo run --release -- --screenshot out/shot.png
@@ -100,7 +106,7 @@ it a bug: a disc that looks elliptical off-axis, for example, is correct rectili
 
 ## Performance
 
-Measured at 1280x720 on an AMD RX 7800 XT (RADV, Mesa 24.2.8), via `--no-vsync`:
+Measured on an AMD RX 7800 XT (RADV, Mesa 24.2.8) via `--no-vsync`. Stages at 1280x720:
 
 | Stage | Frame time |
 | --- | --- |
@@ -113,6 +119,10 @@ Measured at 1280x720 on an AMD RX 7800 XT (RADV, Mesa 24.2.8), via `--no-vsync`:
 Reading the four dials from a uniform instead of a `const` and drawing the egui panel are both
 free at this resolution: 8.03 ms measured against the 8.0 ms baseline. Constants that the compiler
 could fold are worth keeping as constants anyway, but the cost of promoting one is not the reason.
+
+Cost is per pixel, so it scales with the pixel count: the full renderer costs 8.0 ms at 1280x720,
+17 ms (~59 fps) at 1920x1080, and 26-31 ms (~32-39 fps) at 2560x1440. 1920x1080 is the largest
+size that still holds 60 fps on this card, which is why it is the default.
 
 Cost scales with `PRIMARY_STEPS` times `LIGHT_STEPS` times `FBM_OCTAVES`, since density is
 recomputed procedurally at every sample. That product is the first thing to cut when adding
