@@ -1,0 +1,178 @@
+#!/usr/bin/env -S uv run --script
+# usage: tools/imgstat <render.png>... [--ref golden.png] [--json]
+# desc: Score a rendered frame for detail and contrast, and against a reference
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["numpy>=2.0", "pillow>=10.0"]
+# ///
+"""Guards against a fix that works by making the picture worse.
+
+A repetition fix can always cheat by blurring: smear the field enough and
+nothing repeats because nothing is there. These are the numbers that catch it.
+
+contrast    RMS contrast of the luminance. Clouds losing their modelling show
+            up here before they show up anywhere else.
+detail      RMS of the image minus a 2 px Gaussian blur of itself: how
+            much of the picture lives in its edges. A spectral-share version
+            of this was tried first and was useless — cloud power falls off
+            so steeply that the top band holds a millionth of the energy and
+            every image scored 0.00000. High-pass RMS separates the same
+            images by a factor of four.
+slope       Slope of log power against log frequency, over the band where
+            there is signal to fit. Diagnostic rather than a pass/fail: it
+            says whether the field still falls off like a natural scene.
+ssim        Structural similarity against --ref, when a reference is
+            meaningful.
+
+A reference is only meaningful when the two images are supposed to depict the
+same thing — more march steps against fewer, say. Comparing a new noise field
+against a render of the old one measures how much the field changed, which is
+the thing that was asked for, so SSIM is the wrong tool there and the
+intrinsic numbers above are the right ones.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+# Rec. 709 luma, the weighting the eye gives each primary.
+LUMA = np.array([0.2126, 0.7152, 0.0722])
+
+
+def load(path: Path) -> np.ndarray:
+    img = Image.open(path).convert("RGB")
+    return np.asarray(img, dtype=np.float64) @ LUMA / 255.0
+
+
+def gaussian(radius: int, sigma: float) -> np.ndarray:
+    x = np.arange(-radius, radius + 1)
+    k = np.exp(-(x**2) / (2 * sigma**2))
+    return k / k.sum()
+
+
+def blur(a: np.ndarray, k: np.ndarray) -> np.ndarray:
+    """Separable convolution with edge padding."""
+    r = len(k) // 2
+    p = np.pad(a, r, mode="edge")
+    out = np.apply_along_axis(lambda m: np.convolve(m, k, mode="valid"), 1, p)
+    return np.apply_along_axis(lambda m: np.convolve(m, k, mode="valid"), 0, out)
+
+
+def ssim(a: np.ndarray, b: np.ndarray) -> float:
+    """Structural similarity, 11-tap Gaussian window, the standard constants."""
+    if a.shape != b.shape:
+        raise ValueError(f"shape mismatch: {a.shape} vs {b.shape}")
+    k = gaussian(5, 1.5)
+    c1, c2 = 0.01**2, 0.03**2
+
+    mu_a, mu_b = blur(a, k), blur(b, k)
+    maa, mbb, mab = mu_a * mu_a, mu_b * mu_b, mu_a * mu_b
+    var_a = blur(a * a, k) - maa
+    var_b = blur(b * b, k) - mbb
+    cov = blur(a * b, k) - mab
+
+    num = (2 * mab + c1) * (2 * cov + c2)
+    den = (maa + mbb + c1) * (var_a + var_b + c2)
+    return float(np.mean(num / den))
+
+
+def spectrum_1d(a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Radially averaged power spectrum, and the matching frequency axis."""
+    h, w = a.shape
+    n = min(h, w)
+    # Crop to a centred square so the two axes carry the same frequency scale.
+    a = a[(h - n) // 2:(h - n) // 2 + n, (w - n) // 2:(w - n) // 2 + n]
+
+    # A window stops the image edges from reading as a step, which would dump
+    # broadband energy into the spectrum and flatten the slope.
+    win = np.hanning(n)
+    p = np.abs(np.fft.fft2((a - a.mean()) * np.outer(win, win))) ** 2
+
+    f = np.fft.fftfreq(n) * n
+    ky, kx = np.meshgrid(f, f, indexing="ij")
+    r = np.hypot(ky, kx).astype(int)
+    counts = np.bincount(r.ravel(), minlength=n)
+    power = np.bincount(r.ravel(), weights=p.ravel(), minlength=n)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        radial = power / counts
+    freq = np.arange(n)
+    keep = (freq >= 1) & (freq <= n // 2) & np.isfinite(radial[:n])
+    return freq[keep], radial[:n][keep]
+
+
+def measure(path: Path, ref: np.ndarray | None) -> dict:
+    a = load(path)
+    freq, power = spectrum_1d(a)
+
+    # Fit over the middle of the band: the lowest frequencies are dominated by
+    # the sky gradient and the very highest by the dither.
+    # Below 4 the sky gradient dominates; above a sixteenth of the span the
+    # power has fallen into the dither and the fit stops meaning anything.
+    band = (freq >= 4) & (freq <= max(8, len(freq) // 8))
+    slope = float(np.polyfit(np.log(freq[band]), np.log(power[band]), 1)[0]) if band.sum() > 8 else float("nan")
+
+    # High-pass RMS. See the note on `detail` above for why this replaced
+    # a spectral energy share.
+    detail = float((a - blur(a, gaussian(6, 2.0))).std())
+
+    row = {
+        "file": str(path),
+        "contrast": round(float(a.std()), 4),
+        "detail": round(detail, 5),
+        "slope": round(slope, 3),
+        "mean": round(float(a.mean()), 4),
+    }
+    if ref is not None:
+        row["ssim"] = round(ssim(a, ref), 4)
+    return row
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args or "-h" in args or "--help" in args:
+        print(__doc__.strip() + "\n\nusage: tools/imgstat <render.png>... [--ref golden.png] [--json]")
+        return 0 if args else 2
+
+    ref_path, as_json, paths = None, False, []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--ref":
+            i += 1
+            ref_path = Path(args[i])
+        elif a == "--json":
+            as_json = True
+        elif a.startswith("-"):
+            print(f"imgstat: unknown option {a}", file=sys.stderr)
+            return 2
+        else:
+            paths.append(Path(a))
+        i += 1
+
+    ref = load(ref_path) if ref_path else None
+    rows, failed = [], 0
+    for p in paths:
+        try:
+            rows.append(measure(p, ref))
+        except (OSError, ValueError) as e:
+            failed += 1
+            print(f"imgstat: {p}: {e}", file=sys.stderr)
+
+    if as_json:
+        print(json.dumps(rows, indent=2))
+    elif rows:
+        has_ssim = "ssim" in rows[0]
+        head = f"{'file':<34} {'contrast':>9} {'detail':>8} {'slope':>7} {'mean':>7}"
+        print(head + (f" {'ssim':>7}" if has_ssim else ""))
+        for r in rows:
+            line = (f"{Path(r['file']).name:<34} {r['contrast']:>9.4f} {r['detail']:>8.5f} "
+                    f"{r['slope']:>7.2f} {r['mean']:>7.4f}")
+            print(line + (f" {r['ssim']:>7.4f}" if has_ssim else ""))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
