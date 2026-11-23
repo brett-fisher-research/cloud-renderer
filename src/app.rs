@@ -7,6 +7,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::keyboard::ModifiersState;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -15,6 +16,7 @@ use crate::camera::Camera;
 use crate::gpu::{Gpu, create_instance};
 use crate::params::Params;
 use crate::renderer::Renderer;
+use crate::ui::Ui;
 use crate::watch;
 
 /// Everything that only exists once a window has been created.
@@ -24,6 +26,8 @@ struct Active {
     config: wgpu::SurfaceConfiguration,
     gpu: Gpu,
     renderer: Renderer,
+    /// The dial panel drawn over the clouds.
+    ui: Ui,
     /// Shader-file-changed notifications from the watcher thread.
     shader_changes: Receiver<()>,
 }
@@ -40,6 +44,8 @@ pub struct App {
     // Input state.
     dragging: bool,
     last_cursor: Option<(f64, f64)>,
+    /// Live modifier keys; shift turns a drag into a sun-compass drag.
+    modifiers: ModifiersState,
 
     // FPS counter state.
     frames: u32,
@@ -58,6 +64,7 @@ impl App {
             start: Instant::now(),
             dragging: false,
             last_cursor: None,
+            modifiers: ModifiersState::empty(),
             frames: 0,
             last_fps_update: Instant::now(),
             last_fps_log: Instant::now(),
@@ -121,6 +128,17 @@ impl App {
                     label: Some("frame encoder"),
                 });
         active.renderer.draw(&mut encoder, &view);
+        // The panel draws second, over the top, in a pass that loads rather
+        // than clears what the clouds just wrote.
+        active.ui.draw(
+            &active.gpu,
+            &active.window,
+            &mut encoder,
+            &view,
+            (active.config.width, active.config.height),
+            &mut self.params,
+            self.fps,
+        );
         active.gpu.queue.submit(Some(encoder.finish()));
         // In wgpu 30 presenting goes through the queue, not the frame itself.
         active.gpu.queue.present(frame);
@@ -219,9 +237,13 @@ impl ApplicationHandler for App {
         );
 
         let renderer = Renderer::new(&gpu, config.format).expect("failed to build renderer");
+        let ui = Ui::new(&gpu, &window, config.format);
         let shader_changes = watch::watch_file(renderer.shader_path());
 
-        log::info!("controls: drag = look around, scroll = sun elevation, Esc = quit");
+        log::info!(
+            "controls: drag = look around, shift-drag = sun compass, \
+             scroll = sun elevation, Esc = quit"
+        );
 
         self.active = Some(Active {
             window,
@@ -229,6 +251,7 @@ impl ApplicationHandler for App {
             config,
             gpu,
             renderer,
+            ui,
             shader_changes,
         });
         self.start = Instant::now();
@@ -240,10 +263,26 @@ impl ApplicationHandler for App {
         _id: WindowId,
         event: WindowEvent,
     ) {
+        // egui gets first refusal on every event. `consumed` is true when the
+        // pointer is over the panel or a slider has grabbed the drag, and the
+        // camera must then stay still — otherwise nudging a slider would also
+        // spin the sky.
+        let consumed = match self.active.as_mut() {
+            Some(active) => {
+                let window = active.window.clone();
+                active.ui.on_event(&window, &event)
+            }
+            None => false,
+        };
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
+            WindowEvent::ModifiersChanged(mods) => self.modifiers = mods.state(),
+
             WindowEvent::KeyboardInput { event, .. } => {
+                // Esc quits even while typing in the panel; there is nothing
+                // in there to type into.
                 if event.state == ElementState::Pressed
                     && event.logical_key == Key::Named(NamedKey::Escape)
                 {
@@ -262,9 +301,18 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
-                    self.dragging = state == ElementState::Pressed;
-                    if !self.dragging {
-                        self.last_cursor = None;
+                    match state {
+                        // Only *start* a drag if egui did not want the click,
+                        // so pressing on a slider does not also grab the camera.
+                        ElementState::Pressed => self.dragging = !consumed,
+                        // Always *end* one, consumed or not. Releasing over the
+                        // panel after a drag that began on the sky is consumed
+                        // by egui, and ignoring it would leave the camera stuck
+                        // spinning with every later mouse move.
+                        ElementState::Released => {
+                            self.dragging = false;
+                            self.last_cursor = None;
+                        }
                     }
                 }
             }
@@ -273,8 +321,16 @@ impl ApplicationHandler for App {
                 let now = (position.x, position.y);
                 if self.dragging {
                     if let Some(prev) = self.last_cursor {
-                        self.camera
-                            .look((now.0 - prev.0) as f32, (now.1 - prev.1) as f32);
+                        let (dx, dy) = ((now.0 - prev.0) as f32, (now.1 - prev.1) as f32);
+                        if self.modifiers.shift_key() {
+                            // Shift-drag walks the sun around the compass. It
+                            // changes the image more than any slider: it moves
+                            // the silver lining from one side of a cloud to the
+                            // other, and swings every shadow with it.
+                            self.camera.drag_sun_azimuth(dx);
+                        } else {
+                            self.camera.look(dx, dy);
+                        }
                     }
                 }
                 self.last_cursor = Some(now);
@@ -282,7 +338,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorLeft { .. } => self.last_cursor = None,
 
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !consumed => {
                 let notches = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,

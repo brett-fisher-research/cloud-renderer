@@ -14,6 +14,7 @@ mod gpu;
 mod params;
 mod renderer;
 mod screenshot;
+mod ui;
 mod watch;
 
 use anyhow::{Context, Result};

@@ -73,6 +73,16 @@ impl Camera {
         self.pitch = (self.pitch - dy * SENSITIVITY).clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
+    /// Apply a horizontal mouse drag to the sun's compass bearing.
+    ///
+    /// Elevation is "time of day"; azimuth is which way you are facing when
+    /// you see it. Moving it swings every cloud shadow and slides the silver
+    /// lining around the cloud edges.
+    pub fn drag_sun_azimuth(&mut self, dx: f32) {
+        const SUN_DRAG_SENSITIVITY: f32 = 0.004;
+        self.sun_azimuth += dx * SUN_DRAG_SENSITIVITY;
+    }
+
     /// Apply a scroll notch, moving the sun up or down ("time of day").
     pub fn scroll_sun(&mut self, notches: f32) {
         const SUN_SPEED: f32 = 0.04;

@@ -20,6 +20,8 @@ geometry, no scene graph and no per-pixel work.
 - `src/main.rs` — argument parsing, picks windowed or headless mode.
 - `src/gpu.rs` — wgpu instance, adapter, device and queue. Vulkan-only; logs every adapter it sees.
 - `src/camera.rs` — look-around camera and the `Uniforms` struct sent to the GPU.
+- `src/params.rs` — the four live-tunable cloud dials and their slider ranges.
+- `src/ui.rs` — the egui panel those dials are drawn on.
 - `src/renderer.rs` — pipeline, uniform buffer, and shader compilation with hot-reload.
 - `src/app.rs` — winit event loop, mouse input, FPS counter.
 - `src/screenshot.rs` — headless render of one frame to a PNG.
@@ -28,6 +30,9 @@ geometry, no scene graph and no per-pixel work.
 ### Shader side (WGSL)
 
 `shaders/clouds.wgsl` holds everything visual. Its tunable constants sit in one block at the top.
+Four of them — coverage, noise feature size, shadow strength and exposure — are not constants but
+live dials in a second uniform buffer (`struct Params`, `@group(0) @binding(1)`), driven by the
+on-screen panel. Everything else is still a `const` and changes on save via hot-reload.
 The fragment shader, per pixel:
 
 1. Builds a view ray from the camera basis in the uniforms.
@@ -49,7 +54,11 @@ The fragment shader, per pixel:
 - Colours in the shader are linear radiance and may exceed 1.0. Tone mapping and sRGB encoding
   happen at the very end, so constants look darker than the image they produce.
 - `Uniforms` in `src/camera.rs` and `struct Uniforms` in the shader must match exactly, including
-  the padding floats after each `vec3`. A mismatch gives silent garbage, not an error.
+  the padding floats after each `vec3`. A mismatch gives silent garbage, not an error. The same
+  goes for `Params` in `src/params.rs`; it is kept to plain `f32`s so there is no padding to get
+  wrong, which is why a fifth dial means adding three more to keep the size a multiple of 16.
+- The params uniform is named `dials` in the shader, not `p`, because `cloud_density` already uses
+  `p` for the sample point.
 
 ## Running it
 
@@ -58,8 +67,15 @@ cargo run --release                   # open a window
 cargo run --release -- --no-vsync     # uncapped, for benchmarking
 ```
 
-Controls: drag the mouse to look around, scroll to raise or lower the sun, Esc to quit. The title
-bar shows frame rate, resolution and sun elevation; frame rate is also logged every two seconds.
+Controls: drag the mouse to look around, shift-drag to swing the sun around the compass, scroll to
+raise or lower the sun, Esc to quit. The title bar shows frame rate, resolution and sun elevation;
+frame rate is also logged every two seconds.
+
+A panel in the top-left has sliders for the four dials that change the look the most: **coverage**
+(how much of the sky is cloud), **feature size** (how big the clouds are), **shadow** (how strongly
+they shadow themselves — low fakes the multiple scattering that keeps real clouds bright) and
+**exposure** (overall brightness). The panel swallows mouse input while the pointer is over it, so
+dragging a slider does not also spin the camera.
 
 Edit `shaders/clouds.wgsl` while it runs and the change appears on save. If the shader fails to
 compile, the error prints with the offending line and the last working version keeps rendering.
@@ -74,8 +90,9 @@ cargo run --release -- --screenshot out/shot.png
 cargo run --release -- --screenshot out/shot.png --time 120 --sun 0.9 --yaw 0.6 --pitch 0.3
 ```
 
-`--time` is animation seconds, and `--sun`, `--yaw` and `--pitch` are radians. `out/*.png` is
-gitignored.
+`--time` is animation seconds, and `--sun`, `--yaw` and `--pitch` are radians. The four dials have
+flags too — `--coverage`, `--feature-size`, `--shadow`, `--exposure` — so a look found by dragging
+sliders can be reproduced headlessly. `out/*.png` is gitignored.
 
 After building anything that changes the image, render a screenshot, look at it, and fix what
 looks wrong before reporting the work as done. When something looks off, measure it before calling
@@ -91,6 +108,11 @@ Measured at 1280x720 on an AMD RX 7800 XT (RADV, Mesa 24.2.8), via `--no-vsync`:
 | Noise clouds, no lighting | 2.3 ms |
 | With sun light march | 7.8 ms |
 | With aerial perspective | 8.0 ms |
+| With the dial panel | 8.0 ms |
+
+Reading the four dials from a uniform instead of a `const` and drawing the egui panel are both
+free at this resolution: 8.03 ms measured against the 8.0 ms baseline. Constants that the compiler
+could fold are worth keeping as constants anyway, but the cost of promoting one is not the reason.
 
 Cost scales with `PRIMARY_STEPS` times `LIGHT_STEPS` times `FBM_OCTAVES`, since density is
 recomputed procedurally at every sample. That product is the first thing to cut when adding
