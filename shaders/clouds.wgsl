@@ -33,7 +33,7 @@ const CLOUD_TOP: f32 = 4200.0;
 // one cloud — one feature size wide. The other two are deliberately not
 // simple ratios of it, so the three patterns never line up twice.
 const SHAPE_TILE: f32 = 4.0;
-const DETAIL_TILE: f32 = 0.47;
+const DETAIL_TILE: f32 = 0.93;
 const WEATHER_TILE: f32 = 9.3;
 
 // The weather map is read a second time, zoomed out and rotated, to vary the
@@ -55,7 +55,7 @@ const BASE_VARIATION: f32 = 0.10;
 // Shape of the dome: how fast a cloud narrows towards its top.
 const TOP_ROUNDING: f32 = 0.60;
 // How strongly the detail texture eats into the cloud's edges.
-const DETAIL_STRENGTH: f32 = 0.13;
+const DETAIL_STRENGTH: f32 = 0.32;
 // Near the camera the detail texture is read again, this much finer.
 const FINE_DETAIL_SCALE: f32 = 4.3;
 const FINE_DETAIL_AMOUNT: f32 = 0.5;
@@ -88,7 +88,7 @@ const WIND_SHEAR: f32 = 500.0;
 const STEP_MIN: f32 = 28.0;
 const STEP_GROWTH: f32 = 0.004;
 // Strides through clear air are this many times longer than steps in cloud.
-const STEP_COARSE: f32 = 3.0;
+const STEP_COARSE: f32 = 2.0;
 // Consecutive empty samples before giving up on short steps.
 const FINE_PATIENCE: i32 = 3;
 const MAX_STEPS: i32 = 220;
@@ -131,7 +131,9 @@ const SUN_GAIN: f32 = 2.0;
 // which is why the underside of a thick cloud is grey, not black, and
 // darker where the cloud above is deeper.
 const DIFFUSE_GAIN: f32 = 0.7;
-const DIFFUSE_FALLOFF: f32 = 0.3;
+const DIFFUSE_FALLOFF: f32 = 0.4;
+// How much the glow still cares about the path to the sun, 0..1.
+const DIFFUSE_DIRECTIONAL: f32 = 0.15;
 
 // Phase function: which way a droplet sends light. Mostly forwards (the
 // silver lining around a cloud in front of the sun), a little backwards.
@@ -145,7 +147,7 @@ const AMBIENT_GAIN: f32 = 0.9;
 // falling on it. Clouds light each other and the ground beneath them.
 const CLOUD_GLOW: f32 = 0.12;
 // How much darker the base is than the top under skylight alone.
-const AMBIENT_BASE: f32 = 0.15;
+const AMBIENT_BASE: f32 = 0.3;
 // How quickly skylight dies away inside dense cloud.
 const AMBIENT_OCCLUSION: f32 = 0.6;
 
@@ -154,7 +156,10 @@ const SKY_STEPS: i32 = 14;           // atmosphere samples on a clear ray
 const SKY_STEPS_NEAR: i32 = 6;       // ...in front of a cloud
 const SKY_STEPS_FAR: i32 = 8;        // ...behind it
 const GROUND_COLOR: vec3<f32> = vec3<f32>(0.16, 0.17, 0.11);
+const GROUND_SHADOW_STEPS: i32 = 12; // cloud samples for shadows on the ground
 const SUN_DISC: f32 = 1.0;           // 0 hides the sun's disc
+// Lens glare around the sun, as a fraction of the disc's own brightness.
+const SUN_GLARE: f32 = 0.004;
 // Auto exposure. The sky at dusk is thousands of times darker than at noon;
 // a camera compensates. 1.0 would compensate fully and make dusk look like
 // day; 0 not at all.
@@ -327,6 +332,7 @@ struct VsOut {
     @location(1) @interpolate(flat) ambient_sky: vec3<f32>,    // mean sky radiance
     @location(2) @interpolate(flat) ambient_ground: vec3<f32>, // mean radiance of the ground
     @location(3) @interpolate(flat) exposure: f32,
+    @location(4) @interpolate(flat) sun_glare: vec3<f32>,      // lens glare colour
 };
 
 // Average sky radiance seen from inside the cloud layer.
@@ -374,8 +380,8 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
     // the clouds, and the clouds themselves, which are white and bright.
     // The more cloud, the greyer and more even the light. This is why a
     // cloud's shaded side is grey rather than sky blue.
-    let cloud_glow = vec3<f32>(CLOUD_GLOW * dot(sun_on_cloud + clear_sky, luma));
-    let sky = mix(clear_sky, cloud_glow, min(0.25 + 0.65 * c, 1.0));
+    let cloud_glow = vec3<f32>(CLOUD_GLOW * dot(sun_on_cloud, luma) + 0.6 * dot(clear_sky, luma));
+    let sky = mix(clear_sky, cloud_glow, min(0.4 + 0.6 * c, 1.0));
 
     // A matte surface under light of irradiance E has radiance albedo*E/pi.
     // Clouds shade some of the ground from the direct sun.
@@ -389,6 +395,12 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
     // 0.055 is the key of a clear midday sky, so EXPOSURE_BASE means what it
     // says at noon and adaptation only acts as the light fails.
     out.exposure = EXPOSURE_BASE * pow(0.055 / max(key, 1.0e-5), EXPOSURE_ADAPTATION);
+
+    // How much of the sun the camera can see: its colour after the air,
+    // dimmed by any cloud in the way.
+    let cam_r = R_GROUND + 0.001 * CAMERA_HEIGHT;
+    out.sun_glare = SUN_GLARE / (PI * 0.00465 * 0.00465)
+        * sun_transmittance(cam_r, u.sun_dir.y) * camera_sun_visibility();
     return out;
 }
 
@@ -638,6 +650,20 @@ fn march_clouds(dir: vec3<f32>, pixel: vec2<f32>, in: VsOut) -> Clouds {
             misses = 0;
             let depth = light_march(xz, height, sun_xz, sun_rise, max(LIGHT_STEP_SIZE, dt * 0.8), fract(noise + 0.754877666 * f32(i)));
 
+            // Two measures of how deep in the cloud this sample is. `depth`
+            // is the cloud between here and the sun: exact, and full of the
+            // shadows of every bump along the way. `overhead` is simply how
+            // much cloud lies above, from the weather map: smooth.
+            //
+            // Light that has bounced once remembers where the sun is and
+            // casts sharp shadows. Light that has bounced many times has
+            // forgotten, and only knows how buried it is. So each octave
+            // leans further from `depth` towards `overhead` — without that,
+            // the cloud's own lumps cast streaks right through it and onto
+            // its underside, which no real cloud shows.
+            let overhead = max(w.y - height, 0.0) * (CLOUD_TOP - CLOUD_BOTTOM)
+                * EXTINCTION * dials.shadow_strength * 0.5 * w.x;
+
             // Sum the scattering octaves: see MS_OCTAVES.
             var sun_scatter = 0.0;
             var attenuation = 1.0;
@@ -648,13 +674,16 @@ fn march_clouds(dir: vec3<f32>, pixel: vec2<f32>, in: VsOut) -> Clouds {
                     henyey_greenstein(nu, PHASE_G_BACKWARD * eccentricity),
                     henyey_greenstein(nu, PHASE_G_FORWARD * eccentricity),
                     PHASE_BLEND);
-                sun_scatter += contribution * phase * exp(-depth * attenuation);
+                let forgotten = f32(o) / f32(max(MS_OCTAVES - 1, 1));
+                let d = mix(depth, min(depth, overhead * 2.0), forgotten);
+                sun_scatter += contribution * phase * exp(-d * attenuation);
                 attenuation *= MS_ATTENUATION;
                 contribution *= MS_CONTRIBUTION;
                 eccentricity *= MS_ECCENTRICITY;
             }
             // The slow diffuse glow: see DIFFUSE_GAIN.
-            sun_scatter += DIFFUSE_GAIN / (4.0 * PI) / (1.0 + DIFFUSE_FALLOFF * depth);
+            sun_scatter += DIFFUSE_GAIN / (4.0 * PI)
+                / (1.0 + DIFFUSE_FALLOFF * (overhead + DIFFUSE_DIRECTIONAL * depth));
 
             // Skylight from above and light bounced off the ground from
             // below. Each fills half the sphere of directions; the top of a
@@ -693,24 +722,50 @@ fn march_clouds(dir: vec3<f32>, pixel: vec2<f32>, in: VsOut) -> Clouds {
     return out;
 }
 
+// How much of the sun is visible from the camera through the clouds, 0..1.
+fn camera_sun_visibility() -> f32 {
+    let rise = max(u.sun_dir.y, 0.02);
+    let thickness = CLOUD_TOP - CLOUD_BOTTOM;
+    let n = 24.0;
+    let step = thickness / n / rise;
+    let lod = lods_for(step);
+    var depth = 0.0;
+    for (var i = 0; i < 24; i++) {
+        let height = (f32(i) + 0.5) / n;
+        let s = (CLOUD_BOTTOM - CAMERA_HEIGHT + height * thickness) / rise;
+        let p = u.sun_dir.xz * s;
+        depth += cloud_density(p, height, weather(p, lod.x), lod, false);
+    }
+    return exp(-depth * step * EXTINCTION);
+}
+
 // How much direct sun reaches a point on the ground through the clouds.
 fn ground_shadow(xz: vec2<f32>) -> f32 {
     let rise = u.sun_dir.y;
-    if (rise < 0.04) {
+    if (rise < 0.03) {
         return 1.0;
     }
+    // Walk the sun ray up through the whole layer. With the sun low that is
+    // a long slanted path, so the samples must be close enough together not
+    // to step over a cloud — otherwise each sample height casts its own
+    // separate copy of the shadow.
     var depth = 0.0;
     let thickness = CLOUD_TOP - CLOUD_BOTTOM;
-    for (var i = 0; i < 4; i++) {
-        let height = (f32(i) + 0.5) / 4.0;
+    let n = f32(GROUND_SHADOW_STEPS);
+    let step = thickness / n / rise;
+    let lod = lods_for(step);
+    for (var i = 0; i < GROUND_SHADOW_STEPS; i++) {
+        let height = (f32(i) + 0.5) / n;
         let s = (CLOUD_BOTTOM + height * thickness) / rise;
         let p = xz + u.sun_dir.xz * s;
-        let lod = vec2<f32>(2.0, 3.0);
         depth += cloud_density(p, height, weather(p, lod.x), lod, false);
     }
-    depth *= thickness / 4.0 / rise * EXTINCTION;
+    depth *= step * EXTINCTION;
     // Never fully black: light scatters down through a cloud as well.
-    return max(exp(-depth), 0.25 * exp(-0.15 * depth));
+    let shadow = max(exp(-depth), 0.25 * exp(-0.15 * depth));
+    // Fade the shadows out as the sun nears the horizon, where they would
+    // stretch for ever.
+    return mix(1.0, shadow, smoothstep(0.03, 0.10, rise));
 }
 
 // ===========================================================================
@@ -801,6 +856,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (DEBUG == 4) { return vec4<f32>(vec3<f32>(disc_dbg), 1.0); }
     // Exposure scales linear radiance like a camera's shutter; the tone map
     // then compresses the bright end.
+    // Glare: light from the sun spreading inside the lens. It lies over the
+    // whole picture, clouds included, but only while the sun itself is in
+    // clear view of the camera.
+    let glare_angle = acos(clamp(nu, -1.0, 1.0)) / 0.00465;
+    col += in.sun_glare * pow(1.0 + glare_angle * glare_angle, -1.5);
+
     col = tone_map(col * in.exposure * dials.exposure);
 
     // A smooth sky gradient in 8 bits shows visible bands. Adding less than

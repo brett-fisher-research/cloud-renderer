@@ -246,7 +246,7 @@ fn bake_multiscatter(transmittance: &Table) -> Table {
 }
 
 /// IEEE half-float bits for a small non-negative number.
-fn half(v: f32) -> u16 {
+pub fn half(v: f32) -> u16 {
     let v = v.clamp(0.0, 65000.0);
     if v < 6.2e-5 {
         // Subnormal halves: plenty for a transmittance near zero.

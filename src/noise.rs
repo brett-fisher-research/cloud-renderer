@@ -166,15 +166,15 @@ fn stretch(field: &[f32]) -> Vec<u8> {
 }
 
 /// Remap a field through its own CDF so its values are spread evenly over
-/// 0..255. A threshold at `1 - c` then passes exactly the fraction `c` of the
+/// 0..1. A threshold at `1 - c` then passes exactly the fraction `c` of the
 /// field — which is what makes the coverage dial mean what it says.
-fn equalise(field: &[f32]) -> Vec<u8> {
+fn equalise(field: &[f32]) -> Vec<f32> {
     let mut order: Vec<u32> = (0..field.len() as u32).collect();
     order.sort_by(|&a, &b| field[a as usize].partial_cmp(&field[b as usize]).unwrap());
-    let mut out = vec![0u8; field.len()];
+    let mut out = vec![0.0f32; field.len()];
     let n = field.len() as f32;
     for (rank, &i) in order.iter().enumerate() {
-        out[i as usize] = ((rank as f32 + 0.5) / n * 255.0).round() as u8;
+        out[i as usize] = (rank as f32 + 0.5) / n;
     }
     out
 }
@@ -223,7 +223,7 @@ pub fn bake_weather(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wg
         perlin_fbm(p, 6, 5, 500) * 0.5 + 0.5 + 0.35 * worley([x, y, 0.5], 8, 600)
     }));
     let height = equalise(&fill(n, n, 1, |x, y, _| perlin_fbm([x, y, 0.71], 3, 4, 700)));
-    let texels: Vec<u8> = coverage.iter().zip(&height).flat_map(|(&c, &h)| [c, h]).collect();
+    let texels: Vec<f32> = coverage.iter().zip(&height).flat_map(|(&c, &h)| [c, h]).collect();
 
     // 2D mip chain, two channels.
     let mut mips = vec![texels];
@@ -231,16 +231,16 @@ pub fn bake_weather(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wg
     while extent > 1 {
         let prev = mips.last().unwrap();
         let half = extent / 2;
-        let mut level = vec![0u8; half * half * 2];
+        let mut level = vec![0.0f32; half * half * 2];
         for y in 0..half {
             for x in 0..half {
                 for c in 0..2 {
-                    let at = |sx: usize, sy: usize| prev[(sy * extent + sx) * 2 + c] as u32;
+                    let at = |sx: usize, sy: usize| prev[(sy * extent + sx) * 2 + c];
                     let sum = at(x * 2, y * 2)
                         + at(x * 2 + 1, y * 2)
                         + at(x * 2, y * 2 + 1)
                         + at(x * 2 + 1, y * 2 + 1);
-                    level[(y * half + x) * 2 + c] = (sum / 4) as u8;
+                    level[(y * half + x) * 2 + c] = sum / 4.0;
                 }
             }
         }
@@ -254,12 +254,17 @@ pub fn bake_weather(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wg
         mip_level_count: mips.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rg8Unorm,
+        // Half floats, not bytes. The map is thresholded, and where it is
+        // nearly flat one 8-bit step can span a kilometre: the threshold
+        // then follows that step's edge and cloud outlines (and their
+        // shadows on the ground) come out as polygons.
+        format: wgpu::TextureFormat::Rg16Float,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     for (level, texels) in mips.iter().enumerate() {
         let extent = (size >> level).max(1);
+        let halves: Vec<u16> = texels.iter().map(|&v| crate::atmosphere::half(v)).collect();
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -267,10 +272,10 @@ pub fn bake_weather(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wg
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            texels,
+            bytemuck::cast_slice(&halves),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(extent * 2),
+                bytes_per_row: Some(extent * 4),
                 rows_per_image: Some(extent),
             },
             wgpu::Extent3d { width: extent, height: extent, depth_or_array_layers: 1 },

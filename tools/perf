@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# usage: tools/perf [extra renderer flags, e.g. --def LIGHT_STEPS=6]
+# desc: GPU-time the scene matrix at 2560x1440 and print one line per scene
+#
+# The quick version of `tools/lab run`: no notebook, no scoring, just the
+# median milliseconds for each scene so a change can be judged in seconds.
+# The budget is 13 ms (60 fps with headroom).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+cargo build --release --quiet
+bin=target/release/cloud-renderer
+
+bench() {
+    local label=$1
+    shift
+    "$bin" --bench --size 2560x1440 --label "$label" "$@" 2>/dev/null | tail -1 \
+        | sed -E 's/ +2560x1440.*gpu median +([0-9.]+) ms.*/\t\1 ms/'
+}
+
+bench default "$@"
+bench side-lit --yaw 2.2 --pitch 0.25 "$@"
+bench into-sun --yaw 0.6 --pitch 0.30 "$@"
+bench noon --sun 1.1 --yaw 2.0 --pitch 0.35 "$@"
+bench sunset --sun 0.04 --yaw 0.75 --pitch 0.18 "$@"
+bench overcast-up --coverage 0.85 --pitch 0.55 "$@"
+bench overcast-flat --coverage 0.85 --pitch 0.10 "$@"
+bench broken --coverage 0.60 --pitch 0.20 "$@"
+bench sparse --coverage 0.15 --yaw 2.6 --pitch 0.25 "$@"
+bench up --pitch 1.2 --yaw 2.0 "$@"
+bench horizon --coverage 0.6 --pitch 0.03 --yaw 1.6 "$@"
+bench small --feature-size 600 --yaw 2.2 --pitch 0.3 "$@"
+bench large --feature-size 5000 --coverage 0.6 --pitch 0.3 "$@"
+bench ground --pitch -0.5 "$@"
