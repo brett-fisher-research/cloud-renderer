@@ -19,17 +19,24 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::atmosphere;
+use crate::baked::Baked;
 use crate::camera::Uniforms;
 use crate::defines::Defines;
 use crate::gpu::Gpu;
 use crate::noise;
 use crate::params::Params;
+use crate::shader;
 
-/// Where the shader lives, relative to the crate root.
-pub const SHADER_PATH: &str = "shaders/clouds.wgsl";
+/// Bindings the renderer itself owns in `@group(0)`. Everything else in the
+/// group is a feature's baked texture and carries its own number.
+const BINDING_UNIFORMS: u32 = 0;
+const BINDING_PARAMS: u32 = 1;
+const BINDING_REPEAT_SAMPLER: u32 = 7;
+const BINDING_CLAMP_SAMPLER: u32 = 8;
+const BINDING_HISTORY: u32 = 9;
 
 /// Half floats: the accumulated image is an average of many frames, and 8
 /// bits would round each blend step and never quite converge.
@@ -59,9 +66,9 @@ pub struct Renderer {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     pipelines: Pipelines,
-    /// Views of the five baked textures, kept so the bind groups can be
+    /// Every feature's baked textures, kept so the bind groups can be
     /// rebuilt when the history textures are resized.
-    baked: [wgpu::TextureView; 5],
+    baked: Vec<Baked>,
     noise_sampler: wgpu::Sampler,
     table_sampler: wgpu::Sampler,
     history: History,
@@ -77,7 +84,7 @@ pub struct Renderer {
     prev_basis: Option<[[f32; 3]; 3]>,
     /// Format of whatever we present into (swapchain, or offscreen RGBA).
     target_format: wgpu::TextureFormat,
-    shader_path: PathBuf,
+    shader_dir: PathBuf,
     /// `--def` overrides, re-applied on every hot-reload so a sweep's
     /// constants survive editing the file while it runs.
     defines: Defines,
@@ -121,21 +128,10 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        // Bake everything the shader samples. See `noise.rs` and
-        // `atmosphere.rs` for what each texture holds and why.
-        let noise_shape = noise::bake_shape(device, &gpu.queue, 128);
-        let noise_detail = noise::bake_detail(device, &gpu.queue, 64);
-        let weather = noise::bake_weather(device, &gpu.queue, 512);
-        let (transmittance, multiscatter) = atmosphere::bake(device, &gpu.queue);
-        // A view keeps its texture alive, so the views are all we hold on to.
-        let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
-        let baked = [
-            view(&noise_shape),
-            view(&noise_detail),
-            view(&weather),
-            view(&transmittance),
-            view(&multiscatter),
-        ];
+        // Each feature bakes what its shader file samples and says which
+        // binding it goes on. See the feature's module for what each holds.
+        let mut baked = noise::bake(device, &gpu.queue);
+        baked.extend(atmosphere::bake_tables(device, &gpu.queue));
 
         // Repeat addressing is what makes one cube of noise cover the whole
         // sky: sample coordinates outside 0..1 wrap back around.
@@ -194,20 +190,17 @@ impl Renderer {
             count: None,
         };
 
+        let mut layout_entries = vec![
+            uniform_entry(BINDING_UNIFORMS),
+            uniform_entry(BINDING_PARAMS),
+            sampler_entry(BINDING_REPEAT_SAMPLER),
+            sampler_entry(BINDING_CLAMP_SAMPLER),
+            texture_entry(BINDING_HISTORY, wgpu::TextureViewDimension::D2),
+        ];
+        layout_entries.extend(baked.iter().map(|b| texture_entry(b.binding, b.dimension)));
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cloud layout"),
-            entries: &[
-                uniform_entry(0),
-                uniform_entry(1),
-                texture_entry(2, wgpu::TextureViewDimension::D3),
-                texture_entry(3, wgpu::TextureViewDimension::D3),
-                texture_entry(4, wgpu::TextureViewDimension::D2),
-                texture_entry(5, wgpu::TextureViewDimension::D2),
-                texture_entry(6, wgpu::TextureViewDimension::D2),
-                sampler_entry(7),
-                sampler_entry(8),
-                texture_entry(9, wgpu::TextureViewDimension::D2),
-            ],
+            entries: &layout_entries,
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -217,18 +210,20 @@ impl Renderer {
             immediate_size: 0,
         });
 
-        let shader_path = resolve_shader_path();
-        let source = read_shader(&shader_path)?;
-        let source = defines.apply(&source)?;
+        let shader_dir = shader::resolve_dir();
+        let source = shader::load(&shader_dir)?;
+        let text = defines.apply(&source.text)?;
         if !defines.is_empty() {
             log::info!("shader overrides: {}", defines.summary());
         }
 
         // On first load a broken shader is fatal — there is no "last good"
         // version to fall back to yet.
-        let pipelines = build_pipelines(gpu, &pipeline_layout, target_format, &source, entry)
+        let pipelines = build_pipelines(gpu, &pipeline_layout, target_format, &text, entry)
             .await
-            .map_err(|e| anyhow::anyhow!("shader failed to compile:\n{e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("shader failed to compile:\n{}", source.locate_errors(&e))
+            })?;
 
         // A placeholder history. The first `update` replaces it with one
         // the size of the frame.
@@ -258,7 +253,7 @@ impl Renderer {
             frame: 0,
             prev_basis: None,
             target_format,
-            shader_path,
+            shader_dir,
             defines: defines.clone(),
             entry,
         })
@@ -272,14 +267,14 @@ impl Renderer {
     /// Native only: the web build has no disk to re-read.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn reload_shader(&mut self, gpu: &Gpu) -> Result<()> {
-        let source = read_shader(&self.shader_path)?;
-        let source = self.defines.apply(&source)?;
+        let source = shader::load(&self.shader_dir)?;
+        let text = self.defines.apply(&source.text)?;
 
         match pollster::block_on(build_pipelines(
             gpu,
             &self.pipeline_layout,
             self.target_format,
-            &source,
+            &text,
             self.entry,
         )) {
             Ok(pipelines) => {
@@ -290,13 +285,13 @@ impl Renderer {
                 log::info!("shader reloaded OK");
                 Ok(())
             }
-            Err(e) => Err(anyhow::anyhow!("{e}")),
+            Err(e) => Err(anyhow::anyhow!("{}", source.locate_errors(&e))),
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn shader_path(&self) -> &Path {
-        &self.shader_path
+    pub fn shader_dir(&self) -> &Path {
+        &self.shader_dir
     }
 
     /// Upload this frame's camera uniforms. Call once per frame, before
@@ -467,7 +462,7 @@ fn make_history(
     layout: &wgpu::BindGroupLayout,
     uniform_buffer: &wgpu::Buffer,
     params_buffer: &wgpu::Buffer,
-    baked: &[wgpu::TextureView; 5],
+    baked: &[Baked],
     noise_sampler: &wgpu::Sampler,
     table_sampler: &wgpu::Sampler,
     size: (u32, u32),
@@ -492,25 +487,31 @@ fn make_history(
 
     let make_group = |history: &wgpu::TextureView| {
         let mut entries = vec![
-            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: BINDING_UNIFORMS,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: BINDING_PARAMS,
+                resource: params_buffer.as_entire_binding(),
+            },
         ];
-        for (i, v) in baked.iter().enumerate() {
+        for b in baked {
             entries.push(wgpu::BindGroupEntry {
-                binding: 2 + i as u32,
-                resource: wgpu::BindingResource::TextureView(v),
+                binding: b.binding,
+                resource: wgpu::BindingResource::TextureView(&b.view),
             });
         }
         entries.push(wgpu::BindGroupEntry {
-            binding: 7,
+            binding: BINDING_REPEAT_SAMPLER,
             resource: wgpu::BindingResource::Sampler(noise_sampler),
         });
         entries.push(wgpu::BindGroupEntry {
-            binding: 8,
+            binding: BINDING_CLAMP_SAMPLER,
             resource: wgpu::BindingResource::Sampler(table_sampler),
         });
         entries.push(wgpu::BindGroupEntry {
-            binding: 9,
+            binding: BINDING_HISTORY,
             resource: wgpu::BindingResource::TextureView(history),
         });
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -540,7 +541,7 @@ async fn build_pipelines(
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("clouds.wgsl"),
+        label: Some(shader::MODULE_LABEL),
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
 
@@ -594,35 +595,4 @@ async fn build_pipelines(
         Some(err) => Err(err.to_string()),
         None => Ok(pipelines),
     }
-}
-
-/// The shader source: read from disk natively, so it can be edited while the
-/// program runs. A web page has no disk, so there the file is compiled into
-/// the binary and `path` is unused.
-fn read_shader(path: &Path) -> Result<String> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        log::info!("loading shader from {}", path.display());
-        std::fs::read_to_string(path).with_context(|| format!("could not read {}", path.display()))
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = path;
-        log::info!("using the shader built into the binary");
-        Ok(include_str!("../shaders/clouds.wgsl").to_string())
-    }
-}
-
-/// Find `shaders/clouds.wgsl` whether we were launched from the crate root or
-/// from somewhere else (e.g. a different cwd under `cargo run`).
-fn resolve_shader_path() -> PathBuf {
-    let direct = PathBuf::from(SHADER_PATH);
-    if direct.exists() {
-        return direct;
-    }
-    let from_manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join(SHADER_PATH);
-    if from_manifest.exists() {
-        return from_manifest;
-    }
-    direct
 }

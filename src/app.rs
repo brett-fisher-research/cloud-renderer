@@ -116,7 +116,7 @@ impl Active {
         let renderer = Renderer::new(&gpu, target_format, &defines).await?;
         let ui = Ui::new(&gpu, &window, target_format);
         #[cfg(not(target_arch = "wasm32"))]
-        let shader_changes = watch::watch_file(renderer.shader_path());
+        let shader_changes = watch::watch_shaders(renderer.shader_dir());
 
         Ok(Self {
             window,

@@ -23,8 +23,10 @@
 
 use web_time::Instant;
 
+use crate::baked::Baked;
+
 /// Scramble a lattice cell to 32 well-mixed bits.
-fn hash_u32(x: u32, y: u32, z: u32, seed: u32) -> u32 {
+pub(crate) fn hash_u32(x: u32, y: u32, z: u32, seed: u32) -> u32 {
     let mut h = x.wrapping_mul(0x8da6_b343)
         ^ y.wrapping_mul(0xd816_3841)
         ^ z.wrapping_mul(0xcb1a_b31f)
@@ -37,7 +39,7 @@ fn hash_u32(x: u32, y: u32, z: u32, seed: u32) -> u32 {
     h
 }
 
-fn unit(h: u32) -> f32 {
+pub(crate) fn unit(h: u32) -> f32 {
     (h >> 8) as f32 / 16_777_216.0
 }
 
@@ -132,7 +134,7 @@ fn remap(v: f32, lo: f32, hi: f32, new_lo: f32, new_hi: f32) -> f32 {
 ///
 /// A web page cannot spawn threads (not without special server headers), so
 /// there the whole grid is one chunk, filled on the calling thread.
-fn fill(w: usize, h: usize, d: usize, f: impl Fn(f32, f32, f32) -> f32 + Sync) -> Vec<f32> {
+pub(crate) fn fill(w: usize, h: usize, d: usize, f: impl Fn(f32, f32, f32) -> f32 + Sync) -> Vec<f32> {
     let mut out = vec![0.0f32; w * h * d];
     let threads = if cfg!(target_arch = "wasm32") {
         1
@@ -191,8 +193,18 @@ fn equalise(field: &[f32]) -> Vec<f32> {
     out
 }
 
+/// Bake the three cloud textures. Bindings match `shaders/clouds.wgsl`.
+pub fn bake(device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<Baked> {
+    use wgpu::TextureViewDimension::{D2, D3};
+    vec![
+        Baked::new(2, D3, &bake_shape(device, queue, 128)),
+        Baked::new(3, D3, &bake_detail(device, queue, 64)),
+        Baked::new(4, D2, &bake_weather(device, queue, 512)),
+    ]
+}
+
 /// The cloud shape: Perlin-Worley, with higher Worley octaves remapped in.
-pub fn bake_shape(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wgpu::Texture {
+fn bake_shape(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wgpu::Texture {
     let started = Instant::now();
     let n = size as usize;
     let field = fill(n, n, n, |x, y, z| {
@@ -214,7 +226,7 @@ pub fn bake_shape(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wgpu
 }
 
 /// Edge detail: Worley only, three octaves.
-pub fn bake_detail(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wgpu::Texture {
+fn bake_detail(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wgpu::Texture {
     let started = Instant::now();
     let n = size as usize;
     let field = fill(n, n, n, |x, y, z| worley_fbm([x, y, z], 3, 400));
@@ -225,7 +237,7 @@ pub fn bake_detail(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wgp
 
 /// The weather map. Red: where cloud is. Green: how tall it grows there.
 /// Both equalised, so thresholds on them are literal fractions of the sky.
-pub fn bake_weather(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wgpu::Texture {
+fn bake_weather(device: &wgpu::Device, queue: &wgpu::Queue, size: u32) -> wgpu::Texture {
     let started = Instant::now();
     let n = size as usize;
     let coverage = equalise(&fill(n, n, 1, |x, y, _| {

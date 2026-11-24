@@ -300,7 +300,7 @@ fn upload(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, table: &Table
 }
 
 /// Bake and upload both tables: (transmittance, multiple scattering).
-pub fn bake(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Texture, wgpu::Texture) {
+fn bake(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Texture, wgpu::Texture) {
     let started = Instant::now();
     let transmittance = bake_transmittance();
     let multiscatter = bake_multiscatter(&transmittance);
@@ -310,4 +310,14 @@ pub fn bake(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Texture, wgpu:
     );
     log::info!("baked atmosphere tables in {:.0} ms", started.elapsed().as_secs_f32() * 1000.0);
     out
+}
+
+/// Bake both sky tables. Bindings match `shaders/sky.wgsl`.
+pub fn bake_tables(device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<crate::baked::Baked> {
+    use crate::baked::Baked;
+    let (transmittance, multiscatter) = bake(device, queue);
+    vec![
+        Baked::new(5, wgpu::TextureViewDimension::D2, &transmittance),
+        Baked::new(6, wgpu::TextureViewDimension::D2, &multiscatter),
+    ]
 }

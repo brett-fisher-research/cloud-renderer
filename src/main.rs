@@ -19,6 +19,7 @@
 
 mod app;
 mod atmosphere;
+mod baked;
 #[cfg(not(target_arch = "wasm32"))]
 mod bench;
 mod camera;
@@ -27,6 +28,7 @@ mod noise;
 mod gpu;
 mod params;
 mod renderer;
+mod shader;
 #[cfg(not(target_arch = "wasm32"))]
 mod screenshot;
 mod ui;
