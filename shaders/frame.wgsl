@@ -70,7 +70,7 @@ struct VsOut {
 
 // Average sky radiance seen from inside the cloud layer.
 fn mean_sky() -> vec3<f32> {
-    let r = R_GROUND + 0.0005 * (CLOUD_BOTTOM + CLOUD_TOP);
+    let r = R_GROUND + 0.001 * (dials.cloud_base + 0.5 * CLOUD_THICKNESS);
     let mu_sun = u.sun_dir.y;
     let sin_sun = sqrt(max(1.0 - mu_sun * mu_sun, 0.0));
     var sum = vec3<f32>(0.0);
@@ -107,7 +107,7 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
     let c = dials.coverage;
     let clear_sky = mean_sky();
     let sun_on_ground = sun_transmittance(R_GROUND + 0.001, u.sun_dir.y) * max(u.sun_dir.y, 0.0);
-    let sun_on_cloud = sun_transmittance(R_GROUND + 0.0005 * (CLOUD_BOTTOM + CLOUD_TOP), u.sun_dir.y);
+    let sun_on_cloud = sun_transmittance(R_GROUND + 0.001 * (dials.cloud_base + 0.5 * CLOUD_THICKNESS), u.sun_dir.y);
 
     // What the rest of the sky looks like from any one spot: blue between
     // the clouds, and the clouds themselves, which are white and bright.

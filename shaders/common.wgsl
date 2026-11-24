@@ -53,14 +53,15 @@ struct Uniforms {
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
-// The five live dials. Must match `struct Params` in src/params.rs exactly.
+// The six live dials. Must match `struct Params` in src/params.rs exactly.
 struct Params {
     coverage: f32,         // 0 = clear sky, 1 = solid overcast
     feature_size: f32,     // metres: width of a typical cloud
     shadow_strength: f32,  // scales self-shadowing
     wispiness: f32,        // 0 = smooth, 1 = ragged: scales the detail noise
     exposure: f32,         // overall brightness, on top of auto exposure
-    _pad0: f32,            // unused; these three fill the second 16-byte row
+    cloud_base: f32,       // metres: altitude of the clouds' flat undersides
+    // Unused; these two fill the second 16-byte row.
     _pad1: f32,
     _pad2: f32,
 };

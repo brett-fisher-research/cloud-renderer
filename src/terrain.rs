@@ -43,7 +43,7 @@ pub const EXTENT: f32 = 96_000.0;
 /// of the texels.
 const SIZE: usize = if cfg!(target_arch = "wasm32") { 1024 } else { 2048 };
 
-/// Height of the tallest summit, metres. The cloud base is at 1500 m, so the
+/// Height of the tallest summit, metres. With the cloud base dial below this, the
 /// higher peaks stand in the cloud.
 const PEAK_HEIGHT: f32 = 2800.0;
 /// Width of the broadest ridges, metres.

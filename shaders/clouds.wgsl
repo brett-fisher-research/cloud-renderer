@@ -9,10 +9,10 @@
 // ===========================================================================
 
 // --- The cloud layer --------------------------------------------------------
-// Altitudes in metres. Cumulus bases sit at the height where rising air
-// cools enough to condense, which is why real ones share a flat floor.
-const CLOUD_BOTTOM: f32 = 1500.0;
-const CLOUD_TOP: f32 = 4200.0;
+// Cumulus bases sit at the height where rising air cools enough to condense,
+// which is why real ones share a flat floor. That height is the cloud base
+// dial (`dials.cloud_base`); the layer extends this many metres above it.
+const CLOUD_THICKNESS: f32 = 2700.0;
 
 // Sizes of the three noise textures, as multiples of the feature-size dial.
 // The shape texture has four Worley cells across it, so 4.0 makes one cell —
@@ -212,7 +212,7 @@ fn cloud_density(xz: vec2<f32>, height: f32, w: vec3<f32>, lod: vec2<f32>, detai
 
     // Position in the noise. Height is in metres within the layer, so the
     // noise follows the curve of the planet. Tops lean downwind.
-    let metres = vec3<f32>(xz.x, height * (CLOUD_TOP - CLOUD_BOTTOM), xz.y)
+    let metres = vec3<f32>(xz.x, height * CLOUD_THICKNESS, xz.y)
         + (WIND + SHAPE_DRIFT) * u.time
         + normalize(WIND) * height * WIND_SHEAR;
     let shape = textureSampleLevel(
@@ -310,26 +310,26 @@ fn march_clouds(dir: vec3<f32>, pixel: vec2<f32>, in: VsOut, t_max: f32) -> Clou
     let big_r = R_GROUND * 1000.0;
     let cam_r = big_r + CAMERA_HEIGHT;
     let b = cam_r * dir.y;
-    let t_in = sphere_exit(b, (CAMERA_HEIGHT - CLOUD_BOTTOM) * (2.0 * big_r + CAMERA_HEIGHT + CLOUD_BOTTOM));
+    let t_in = sphere_exit(b, (CAMERA_HEIGHT - dials.cloud_base) * (2.0 * big_r + CAMERA_HEIGHT + dials.cloud_base));
     if (t_in >= t_max) {
         // The ray ends before it reaches the layer.
         return out;
     }
-    let t_shell = sphere_exit(b, (CAMERA_HEIGHT - CLOUD_TOP) * (2.0 * big_r + CAMERA_HEIGHT + CLOUD_TOP));
+    let t_shell = sphere_exit(b, (CAMERA_HEIGHT - (dials.cloud_base + CLOUD_THICKNESS)) * (2.0 * big_r + CAMERA_HEIGHT + (dials.cloud_base + CLOUD_THICKNESS)));
     let t_out = min(t_shell, t_max);
 
     // Sunlight at the point where the ray meets the clouds. The sun's
     // height above the *local* horizon there differs from the camera's:
     // clouds far towards a setting sun are still lit after it sets here.
     let nu = dot(dir, u.sun_dir);
-    let cloud_r = R_GROUND + 0.0005 * (CLOUD_BOTTOM + CLOUD_TOP);
+    let cloud_r = R_GROUND + 0.0005 * (dials.cloud_base + (dials.cloud_base + CLOUD_THICKNESS));
     let t_mid = 0.0005 * (t_in + t_shell);
     let mu_sun = clamp(((R_GROUND + 0.001 * CAMERA_HEIGHT) * u.sun_dir.y + t_mid * nu) / cloud_r, -1.0, 1.0);
     let sun_light = sun_transmittance(cloud_r, mu_sun);
 
     let sun_xz_len = length(u.sun_dir.xz);
     let sun_xz = u.sun_dir.xz / max(sun_xz_len, 1.0e-4) * sqrt(max(1.0 - mu_sun * mu_sun, 0.0));
-    let sun_rise = mu_sun / (CLOUD_TOP - CLOUD_BOTTOM);
+    let sun_rise = mu_sun / CLOUD_THICKNESS;
 
     var noise = pixel_noise(pixel);
     if (JITTER_ANIMATE) {
@@ -358,7 +358,7 @@ fn march_clouds(dir: vec3<f32>, pixel: vec2<f32>, in: VsOut, t_max: f32) -> Clou
         // form that never subtracts two huge numbers.
         let x = 2.0 * t * b + t * t;
         let altitude = CAMERA_HEIGHT + x / (sqrt(cam_r * cam_r + x) + cam_r);
-        let height = (altitude - CLOUD_BOTTOM) / (CLOUD_TOP - CLOUD_BOTTOM);
+        let height = (altitude - dials.cloud_base) / CLOUD_THICKNESS;
         let xz = dir.xz * t;
 
         let lod = lods_for(dt);
@@ -399,7 +399,7 @@ fn march_clouds(dir: vec3<f32>, pixel: vec2<f32>, in: VsOut, t_max: f32) -> Clou
             // leans further from `depth` towards `overhead` — without that,
             // the cloud's own lumps cast streaks right through it and onto
             // its underside, which no real cloud shows.
-            let overhead = max(w.y - height, 0.0) * (CLOUD_TOP - CLOUD_BOTTOM)
+            let overhead = max(w.y - height, 0.0) * CLOUD_THICKNESS
                 * EXTINCTION * dials.shadow_strength * 0.5 * w.x;
 
             // Sum the scattering octaves: see MS_OCTAVES.
@@ -463,14 +463,14 @@ fn march_clouds(dir: vec3<f32>, pixel: vec2<f32>, in: VsOut, t_max: f32) -> Clou
 // How much of the sun is visible from the camera through the clouds, 0..1.
 fn camera_sun_visibility() -> f32 {
     let rise = max(u.sun_dir.y, 0.02);
-    let thickness = CLOUD_TOP - CLOUD_BOTTOM;
+    let thickness = CLOUD_THICKNESS;
     let n = 24.0;
     let step = thickness / n / rise;
     let lod = lods_for(step);
     var depth = 0.0;
     for (var i = 0; i < 24; i++) {
         let height = (f32(i) + 0.5) / n;
-        let s = (CLOUD_BOTTOM - CAMERA_HEIGHT + height * thickness) / rise;
+        let s = (dials.cloud_base - CAMERA_HEIGHT + height * thickness) / rise;
         let p = u.sun_dir.xz * s;
         depth += cloud_density(p, height, weather(p, lod.x), lod, false);
     }
@@ -483,8 +483,8 @@ fn camera_sun_visibility() -> f32 {
 fn cloud_shadow(xz: vec2<f32>, altitude: f32) -> f32 {
     let rise = u.sun_dir.y;
     // Only the part of the layer above the point can shade it.
-    let base = max(CLOUD_BOTTOM, altitude);
-    let thickness = CLOUD_TOP - base;
+    let base = max(dials.cloud_base, altitude);
+    let thickness = (dials.cloud_base + CLOUD_THICKNESS) - base;
     if (rise < 0.03 || thickness <= 0.0) {
         return 1.0;
     }
@@ -498,7 +498,7 @@ fn cloud_shadow(xz: vec2<f32>, altitude: f32) -> f32 {
     let lod = lods_for(step);
     for (var i = 0; i < GROUND_SHADOW_STEPS; i++) {
         let up = (f32(i) + 0.5) / n * thickness;
-        let height = (base - CLOUD_BOTTOM + up) / (CLOUD_TOP - CLOUD_BOTTOM);
+        let height = (base - dials.cloud_base + up) / CLOUD_THICKNESS;
         let s = (base - altitude + up) / rise;
         let p = xz + u.sun_dir.xz * s;
         depth += cloud_density(p, height, weather(p, lod.x), lod, false);

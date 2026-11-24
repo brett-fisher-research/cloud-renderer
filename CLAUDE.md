@@ -49,7 +49,7 @@ present it. It does no geometry, no scene graph and no per-pixel work.
 - `src/shader.rs` — joins the shader files into one module and maps compile errors back to the
   file and line they came from.
 - `src/camera.rs` — look-around camera and the `Uniforms` struct sent to the GPU.
-- `src/params.rs` — the five live dials and their slider ranges.
+- `src/params.rs` — the six live dials and their slider ranges.
 - `src/ui.rs` — the egui panel the dials and the two sun sliders are drawn on.
 - `src/renderer.rs` — pipelines, the bind group built from the features' `Baked` lists, the
   history textures and per-frame temporal state, and hot-reload.
@@ -70,9 +70,9 @@ order does not matter in WGSL, so they refer to each other freely.
 - `frame.wgsl` — the vertex stage, lighting of surfaces, compositing, tone mapping, temporal
   accumulation and the present pass.
 
-Every tunable is a named `const` at the top of its file and changes on save. Five values are
-live dials instead, in `struct Params`: coverage, feature size, shadow strength, wispiness and
-exposure.
+Every tunable is a named `const` at the top of its file and changes on save. Six values are
+live dials instead, in `struct Params`: coverage, feature size, cloud base, shadow strength,
+wispiness and exposure.
 
 Per pixel, `fs_main` in `frame.wgsl`:
 
@@ -80,7 +80,7 @@ Per pixel, `fs_main` in `frame.wgsl`:
 2. Asks the terrain where the ray ends. If it ends on a surface, lights it with sun, skylight
    and the shadow of the clouds above.
 3. Marches the cloud layer as far as that end and no further. The layer is a spherical shell
-   between `CLOUD_BOTTOM` and `CLOUD_TOP` around a round planet; it curves down behind the
+   `CLOUD_THICKNESS` deep above the cloud base dial, around a round planet; it curves down behind the
    horizon, so there is no vanishing point for it to pile into.
 4. Marches the atmosphere in front of the cloud and behind it. The near part fades distant cloud
    into haze (aerial perspective); the far part is the sky, or the hillside, seen through gaps.
@@ -125,7 +125,8 @@ Lighting at each cloud sample:
 A heightfield: one height per map position, so a ray is tested against the ground with a single
 texture fetch and there is no mesh. `src/terrain.rs` bakes a 2048x2048 map of a 96 km square
 centred on the camera: a flat plain out to about 5 km, then a ring of mountains up to 2800 m,
-which puts the higher summits inside the cloud layer.
+which stands below the default 4000 m cloud base; lower the cloud base dial under that and the
+summits stand in cloud.
 
 - Shape: ridged multifractal noise. Folding each noise layer at zero turns its zero crossings
   into creases that read as ridgelines. There is no erosion yet, so no gullies or drainage.
@@ -182,8 +183,8 @@ average of roughly the last twenty.
   happen at the very end.
 - `Uniforms` in `src/camera.rs` and in `shaders/common.wgsl` must match exactly. Each `vec3` takes a 16-byte
   row and uses 12, so one float follows it; four of those slots carry temporal values (`jitter`,
-  `history_frames`, `subpixel_x`, `subpixel_y`). A mismatch gives silent garbage. `Params` is five
-  plain floats and three of padding, two rows; the next three dials take the padding's places.
+  `history_frames`, `subpixel_x`, `subpixel_y`). A mismatch gives silent garbage. `Params` is six
+  plain floats and two of padding, two rows; the next two dials take the padding's places.
 - The atmosphere constants are duplicated in `src/atmosphere.rs` and in `shaders/sky.wgsl` and
   must match, because the tables are baked from one and read by the other.
 - Bindings in `@group(0)`: uniforms 0 and 1, shape 2, detail 3, weather 4, transmittance 5,
@@ -264,16 +265,19 @@ Controls: drag to look around, shift-drag to swing the sun around the compass, s
 lower the sun (it can set), Esc to quit. The panel's two sun sliders set the same two angles. The title bar shows frame rate, resolution and sun
 elevation.
 
-The panel in the top-left has the five dials:
+The panel in the top-left has the six dials:
 
 - coverage — how much of the sky is cloud, 0 clear to 1 overcast.
 - feature size — how wide a typical cloud is, 500 m to 6 km.
+- cloud base — altitude of the clouds' flat undersides, 500 m to 8 km, default 4 km. Higher
+  clouds are further away, so they look smaller and sit further up the sky, and they cost less:
+  at 4 km every lab scene is 0.4 to 1.6 ms cheaper than at 1.5 km.
 - shadow — self-shadowing strength; low glows, high gives heavy dark undersides.
 - wispiness — how ragged the surface is, 0 smooth blobs to 1 torn with loose puffs. The default,
   0.5, is the old fixed look. At 1 the overcast scene costs about 5% more (9.0 to 9.4 ms).
 - exposure — brightness, on top of the automatic exposure that follows the sun down.
 
-Each dial has a flag (`--coverage`, `--feature-size`, `--shadow`, `--wispiness`,
+Each dial has a flag (`--coverage`, `--feature-size`, `--cloud-base`, `--shadow`, `--wispiness`,
 `--exposure`), and `--time`,
 `--sun`, `--yaw`, `--pitch` set the scene, so any look can be reproduced headlessly. `--sun`,
 `--yaw` and `--pitch` are radians. `out/` is gitignored.

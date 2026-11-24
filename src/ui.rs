@@ -176,6 +176,17 @@ impl Ui {
                     );
 
                     ui.add(
+                        egui::Slider::new(&mut params.cloud_base, Params::CLOUD_BASE_RANGE)
+                            .text("cloud base")
+                            .suffix(" m")
+                            .fixed_decimals(0),
+                    )
+                    .on_hover_text(
+                        "How high the clouds' flat undersides are.\n\
+                         Higher clouds are further away: smaller and further up the sky.",
+                    );
+
+                    ui.add(
                         egui::Slider::new(&mut params.wispiness, Params::WISPINESS_RANGE)
                             .text("wispiness")
                             .fixed_decimals(2),

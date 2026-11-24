@@ -12,8 +12,8 @@ use bytemuck::{Pod, Zeroable};
 /// Matches `struct Params` in `shaders/clouds.wgsl`.
 ///
 /// A uniform block is a multiple of 16 bytes, so dials come in fours. There
-/// are five, so three `_pad` floats fill the second row; the next three dials
-/// take their places.
+/// are six, so two `_pad` floats fill the second row; the next two dials take
+/// their places.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Params {
@@ -31,8 +31,11 @@ pub struct Params {
     /// Overall brightness multiplier, applied just before tone mapping, on
     /// top of the automatic exposure.
     pub exposure: f32,
+    /// Altitude of the clouds' flat undersides, in metres. Higher clouds are
+    /// further away, so they look smaller and sit further up the sky.
+    pub cloud_base: f32,
     /// Unused; fills the second 16-byte row.
-    pub _pad: [f32; 3],
+    pub _pad: [f32; 2],
 }
 
 impl Default for Params {
@@ -43,7 +46,8 @@ impl Default for Params {
             shadow_strength: 1.0,
             wispiness: 0.5,
             exposure: 0.5,
-            _pad: [0.0; 3],
+            cloud_base: 4000.0,
+            _pad: [0.0; 2],
         }
     }
 }
@@ -55,5 +59,6 @@ impl Params {
     pub const FEATURE_SIZE_RANGE: std::ops::RangeInclusive<f32> = 500.0..=6000.0;
     pub const SHADOW_STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
     pub const WISPINESS_RANGE: std::ops::RangeInclusive<f32> = 0.0..=1.0;
+    pub const CLOUD_BASE_RANGE: std::ops::RangeInclusive<f32> = 500.0..=8000.0;
     pub const EXPOSURE_RANGE: std::ops::RangeInclusive<f32> = 0.1..=4.0;
 }
