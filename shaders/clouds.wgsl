@@ -226,12 +226,16 @@ struct Uniforms {
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
-// The four live dials. Must match `struct Params` in src/params.rs exactly.
+// The five live dials. Must match `struct Params` in src/params.rs exactly.
 struct Params {
     coverage: f32,         // 0 = clear sky, 1 = solid overcast
     feature_size: f32,     // metres: width of a typical cloud
     shadow_strength: f32,  // scales self-shadowing
     wispiness: f32,        // 0 = smooth, 1 = ragged: scales the detail noise
+    exposure: f32,         // overall brightness, on top of auto exposure
+    _pad0: f32,            // unused; these three fill the second 16-byte row
+    _pad1: f32,
+    _pad2: f32,
 };
 @group(0) @binding(1) var<uniform> dials: Params;
 
@@ -939,7 +943,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Exposure scales linear radiance like a camera's shutter; the tone map
     // then compresses the bright end.
-    col = tone_map(col * in.exposure);
+    col = tone_map(col * in.exposure * dials.exposure);
 
     // Temporal accumulation: blend with what this spot of sky looked like
     // over the previous frames.

@@ -18,11 +18,17 @@ use crate::camera::Camera;
 use crate::gpu::Gpu;
 use crate::params::Params;
 
+/// Width of the panel's contents, in points. Fixed, so the panel is the same
+/// width open or collapsed and never resizes as its labels change.
+const PANEL_WIDTH: f32 = 300.0;
+
 pub struct Ui {
     ctx: egui::Context,
     state: egui_winit::State,
     renderer: egui_wgpu::Renderer,
-    /// Collapsed panels are easy to lose; keep it open to start with.
+    /// Whether the dials are showing, or only the header. egui's own
+    /// collapsing shrinks a window to the width of its title, so the panel
+    /// draws its own header and keeps this itself.
     open: bool,
 }
 
@@ -94,12 +100,34 @@ impl Ui {
         }
 
         let mut reset = false;
+        let mut open = self.open;
         let full_output = self.ctx.run_pass(raw_input, |ctx| {
             egui::Window::new("cloud dials")
-                .default_open(self.open)
+                .title_bar(false)
                 .default_pos([16.0, 16.0])
                 .resizable(false)
                 .show(ctx, |ui| {
+                    ui.set_width(PANEL_WIDTH);
+
+                    // The header: click to fold the dials away.
+                    let arrow = if open { "⏷" } else { "⏵" };
+                    let header = ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("{arrow}  cloud dials")).heading(),
+                            )
+                            .selectable(false)
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if header.clicked() {
+                        open = !open;
+                    }
+                    if !open {
+                        return;
+                    }
+
+                    ui.separator();
                     ui.label(format!("{fps:.0} fps"));
                     ui.separator();
 
@@ -144,6 +172,17 @@ impl Ui {
                     .on_hover_text(
                         "How ragged the cloud surface is.\n\
                          0 = smooth blobs, 1 = torn and wispy.",
+                    );
+
+                    ui.add(
+                        egui::Slider::new(&mut params.exposure, Params::EXPOSURE_RANGE)
+                            .text("exposure")
+                            .logarithmic(true)
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text(
+                        "Overall brightness, on top of the automatic exposure\n\
+                         that follows the sun down.",
                     );
 
                     ui.separator();
@@ -198,6 +237,8 @@ impl Ui {
                     );
                 });
         });
+
+        self.open = open;
 
         if reset {
             *params = Params::default();
