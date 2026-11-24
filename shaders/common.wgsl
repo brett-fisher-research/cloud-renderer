@@ -23,7 +23,7 @@
 // `--def NAME=VALUE`, and the files hot-reload on save.
 
 // Eye height above the ground, in metres.
-const CAMERA_HEIGHT: f32 = 150.0;
+const CAMERA_HEIGHT: f32 = 1.7;
 
 const PI: f32 = 3.14159265;
 

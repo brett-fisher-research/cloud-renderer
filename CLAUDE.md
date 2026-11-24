@@ -176,7 +176,8 @@ average of roughly the last twenty.
 ### Conventions worth knowing
 
 - Units are metres and seconds for clouds, kilometres for the atmosphere. The camera sits at
-  `CAMERA_HEIGHT` (150 m, a hilltop) so the ground reaches a horizon 44 km away and fades into haze.
+  `CAMERA_HEIGHT` (1.7 m, standing eye level), so the plain meets its horizon 4.7 km away and the
+  mountains rise from behind it.
 - Colours are linear radiance with the sun's illuminance as 1.0. Tone mapping and sRGB encoding
   happen at the very end.
 - `Uniforms` in `src/camera.rs` and in `shaders/common.wgsl` must match exactly. Each `vec3` takes a 16-byte
