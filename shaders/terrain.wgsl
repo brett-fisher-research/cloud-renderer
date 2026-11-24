@@ -242,15 +242,15 @@ fn terrain_clear(dir: vec3<f32>, radius: f32) -> f32 {
 // narrowly the ray clears the ground, as an angle, gives a soft edge for the
 // price of the hard one.
 fn terrain_shadow(xz: vec2<f32>, altitude: f32, sun: vec3<f32>) -> f32 {
-    if (!TERRAIN_ENABLED || sun.y <= 0.0) {
-        // Below the horizon the planet is in the way; the sky model's
-        // transmittance already accounts for that.
+    if (!TERRAIN_ENABLED) {
         return 1.0;
     }
     let summit = textureLoad(terrain_map, vec2<i32>(0), i32(textureNumLevels(terrain_map)) - 1).b;
     let texel = TERRAIN_EXTENT / f32(textureDimensions(terrain_map).x);
-    // Past this distance the ray is above every summit.
-    let reach = (summit - altitude) / sun.y;
+    // Past this distance the ray is above every summit, or off the map. With
+    // the sun on or under the horizon the ray never climbs, so the map's
+    // edge is the limit; the division must not be by zero or less.
+    let reach = min((summit - altitude) / max(sun.y, 1.0e-4), 0.5 * TERRAIN_EXTENT);
     if (reach <= texel) {
         return 1.0;
     }
