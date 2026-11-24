@@ -66,6 +66,7 @@ struct VsOut {
     @location(2) @interpolate(flat) ambient_ground: vec3<f32>, // mean radiance of the ground
     @location(3) @interpolate(flat) exposure: f32,
     @location(4) @interpolate(flat) sun_glare: vec3<f32>,      // lens glare colour
+    @location(5) @interpolate(flat) sun_clear: f32,            // share of the sun not behind terrain
 };
 
 // Average sky radiance seen from inside the cloud layer.
@@ -85,7 +86,7 @@ fn mean_sky() -> vec3<f32> {
             nu = mu * mu_sun + 0.8660254 * sin_sun * azimuth;
         }
         let far = sphere_exit(r * mu, (r - R_TOP) * (r + R_TOP));
-        sum += atmosphere(r, mu, nu, mu_sun, 0.0, far, 8).light;
+        sum += atmosphere(r, mu, nu, mu_sun, 0.0, far, 8, vec2<f32>(1.0)).light;
     }
     return sum / 5.0;
 }
@@ -129,11 +130,14 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
     // says at noon and adaptation only acts as the light fails.
     out.exposure = EXPOSURE_BASE * pow(0.055 / max(key, 1.0e-5), EXPOSURE_ADAPTATION);
 
+    // Whether the camera stands in a mountain's shadow.
+    out.sun_clear = terrain_clear(u.sun_dir, 0.00465);
+
     // How much of the sun the camera can see: its colour after the air,
-    // dimmed by any cloud in the way.
+    // dimmed by any cloud in the way, and hidden by any mountain.
     let cam_r = R_GROUND + 0.001 * CAMERA_HEIGHT;
     out.sun_glare = SUN_GLARE / (PI * 0.00465 * 0.00465)
-        * sun_transmittance(cam_r, u.sun_dir.y) * camera_sun_visibility();
+        * sun_transmittance(cam_r, u.sun_dir.y) * camera_sun_visibility() * out.sun_clear;
     return out;
 }
 
@@ -207,7 +211,7 @@ fn tone_map(x: vec3<f32>) -> vec3<f32> {
 // Radiance leaving a surface towards the eye: direct sun, dimmed by the air
 // and by any cloud above, plus skylight. The surface is matte, so the eye's
 // direction does not matter: light of irradiance E gives albedo * E / pi.
-fn light_surface(surface: Surface, dir: vec3<f32>, in: VsOut) -> vec3<f32> {
+fn light_surface(surface: Surface, dir: vec3<f32>, in: VsOut, sun_reaches: f32) -> vec3<f32> {
     let r0 = R_GROUND + CAMERA_HEIGHT * 0.001;
     let r = R_GROUND + surface.altitude * 0.001;
     // The sun's height above the horizon *there*, which on a round planet
@@ -216,7 +220,7 @@ fn light_surface(surface: Surface, dir: vec3<f32>, in: VsOut) -> vec3<f32> {
         (r0 * u.sun_dir.y + surface.distance * 0.001 * dot(dir, u.sun_dir)) / r, -1.0, 1.0);
     // The normal is in the camera's frame; correct its up for that too.
     let facing = max(dot(surface.normal, u.sun_dir) + mu_sun - u.sun_dir.y, 0.0);
-    let sun = sun_transmittance(r + 0.001, mu_sun) * facing
+    let sun = sun_transmittance(r + 0.001, mu_sun) * facing * sun_reaches
         * cloud_shadow(dir.xz * surface.distance, surface.altitude);
     // A slope sees less sky than level ground does.
     let sky = in.ambient_sky * (0.5 + 0.5 * surface.normal.y);
@@ -245,10 +249,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var steps = SKY_STEPS;
     // What is at the end of it: the lit ground, or the sun's disc on black.
     var behind = vec3<f32>(0.0);
+    // How much direct sun the air along the ray gets, at its start and end.
+    // It starts at the camera, which may be in a mountain's shadow, and ends
+    // in open sky unless it ends on a surface.
+    var lit = vec2<f32>(in.sun_clear, 1.0);
     if (surface.hit) {
         t_end = surface.distance * 0.001;
         steps = SKY_STEPS_NEAR;
-        behind = light_surface(surface, dir, in);
+        // Is the surface in another mountain's shadow? The air just in
+        // front of it then is too.
+        lit.y = terrain_shadow(dir.xz * surface.distance, surface.altitude, u.sun_dir);
+        behind = light_surface(surface, dir, in, lit.y);
     } else {
         // The sun itself: a disc half a degree across, far brighter than
         // anything else, dimmer towards its edge ("limb darkening").
@@ -274,12 +285,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // seen through its gaps. Split the ray at the cloud and march each
         // part.
         let t_cloud = clamp(clouds.distance * 0.001, 0.0, t_end);
-        let near = atmosphere(r0, mu, nu, mu_sun0, 0.0, t_cloud, SKY_STEPS_NEAR);
-        let far = atmosphere(r0, mu, nu, mu_sun0, t_cloud, t_end, SKY_STEPS_FAR);
+        let lit_cloud = mix(lit.x, lit.y, t_cloud / max(t_end, 1.0e-6));
+        let near = atmosphere(r0, mu, nu, mu_sun0, 0.0, t_cloud, SKY_STEPS_NEAR, vec2<f32>(lit.x, lit_cloud));
+        let far = atmosphere(r0, mu, nu, mu_sun0, t_cloud, t_end, SKY_STEPS_FAR, vec2<f32>(lit_cloud, lit.y));
         let background = far.light + far.through * behind;
         col = near.light + near.through * (clouds.light + clouds.through * background);
     } else {
-        let air = atmosphere(r0, mu, nu, mu_sun0, 0.0, t_end, steps);
+        let air = atmosphere(r0, mu, nu, mu_sun0, 0.0, t_end, steps, lit);
         col = air.light + air.through * behind;
     }
 

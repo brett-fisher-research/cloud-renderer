@@ -44,6 +44,15 @@ const TERRAIN_SKIP_FINEST: f32 = 2.0;
 // Heightmap mip relative to the pixel's footprint on the ground.
 const TERRAIN_LOD_BIAS: f32 = 0.0;
 
+// --- Shadows ----------------------------------------------------------------
+// Samples marched from a surface point towards the sun to see whether other
+// terrain is in the way. Each step is longer than the last and reads a
+// coarser mip, so a fixed count covers any distance.
+const TERRAIN_SHADOW_STEPS: i32 = 24;
+// Width of a shadow's soft edge, as the angle (radians) by which a sun ray
+// must clear a ridge to count as fully lit. The sun's own radius is 0.005.
+const TERRAIN_SHADOW_SOFTNESS: f32 = 0.02;
+
 // --- Materials ---------------------------------------------------------------
 const GROUND_COLOR: vec3<f32> = vec3<f32>(0.16, 0.17, 0.11);
 const ROCK_COLOR: vec3<f32> = vec3<f32>(0.19, 0.17, 0.15);
@@ -205,4 +214,56 @@ fn terrain_surface(dir: vec3<f32>, noise: f32) -> Surface {
     out.normal = normal;
     out.albedo = mix(GROUND_COLOR, ROCK_COLOR, smoothstep(ROCK_SLOPE_MIN, ROCK_SLOPE_MAX, 1.0 - normal.y));
     return out;
+}
+
+// How much of a small disc of sky around `dir` is clear of terrain, 0..1.
+// `radius` is the disc's angular radius in radians. Nine rays, so the answer
+// fades as a ridge crosses the disc. Costly per call: meant for the vertex
+// stage, once per frame, not per pixel.
+fn terrain_clear(dir: vec3<f32>, radius: f32) -> f32 {
+    let right = normalize(cross(dir, vec3<f32>(0.0, 1.0, 0.0)));
+    let up = cross(right, dir);
+    var clear = 0.0;
+    for (var i = 0; i < 9; i++) {
+        let offset = vec2<f32>(f32(i % 3) - 1.0, f32(i / 3) - 1.0) * 0.7 * radius;
+        let ray = normalize(dir + right * offset.x + up * offset.y);
+        if (!terrain_surface(ray, 0.5).hit) {
+            clear += 1.0;
+        }
+    }
+    return clear / 9.0;
+}
+
+// How much direct sun reaches a point past the terrain around it, 0..1.
+// `xz` and `altitude` locate the point in metres; `sun` points at the sun.
+//
+// Graphics note: a shadow ray. Walk from the point towards the light; if the
+// ground rises above the ray anywhere, the point is in shadow. Tracking how
+// narrowly the ray clears the ground, as an angle, gives a soft edge for the
+// price of the hard one.
+fn terrain_shadow(xz: vec2<f32>, altitude: f32, sun: vec3<f32>) -> f32 {
+    if (!TERRAIN_ENABLED || sun.y <= 0.0) {
+        // Below the horizon the planet is in the way; the sky model's
+        // transmittance already accounts for that.
+        return 1.0;
+    }
+    let summit = textureLoad(terrain_map, vec2<i32>(0), i32(textureNumLevels(terrain_map)) - 1).b;
+    let texel = TERRAIN_EXTENT / f32(textureDimensions(terrain_map).x);
+    // Past this distance the ray is above every summit.
+    let reach = (summit - altitude) / sun.y;
+    if (reach <= texel) {
+        return 1.0;
+    }
+    let growth = pow(reach / texel, 1.0 / f32(TERRAIN_SHADOW_STEPS));
+    var s = texel;
+    var clearance = 1.0;
+    for (var i = 0; i < TERRAIN_SHADOW_STEPS; i++) {
+        let lod = max(log2(s * (growth - 1.0) / texel), 0.0);
+        // The planet curves away under the ray: s^2 / 2R.
+        let ray = altitude + s * sun.y + s * s / (2000.0 * R_GROUND);
+        let ground = terrain_height(xz + sun.xz * s, lod);
+        clearance = min(clearance, (ray - ground) / (TERRAIN_SHADOW_SOFTNESS * s));
+        s *= growth;
+    }
+    return smoothstep(0.0, 1.0, clearance);
 }

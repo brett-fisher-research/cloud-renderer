@@ -140,7 +140,14 @@ summits stand in cloud.
 - The bare sphere is terrain of height zero: `terrain_surface` returns it where there is no
   relief, and `--def TERRAIN_ENABLED=false` gives the picture from before terrain existed.
 - Shading is flat: one matte colour that goes from grass to rock with slope, lit by sun and sky.
-  Mountains do not yet shadow themselves or each other.
+- Shadows: `terrain_shadow` marches 24 growing steps from a surface point towards the sun, with
+  a soft edge. Every surface pixel pays for it, the plain included; it costs 0.1 to 0.3 ms.
+- Shadowed air: the atmosphere march takes how much direct sun the air gets at each end of the
+  ray, blended between. The camera's end is `terrain_clear` (is the sun behind a ridge from
+  here, worked out once a frame); the far end is the surface's own shadow. Without it the haze
+  in front of a range glowed as if the sun were on this side of it. It is an approximation:
+  the air's shadow is not marched, so the sky just above a ridge hiding the sun is too dim.
+- The sun's lens glare is scaled by `terrain_clear` too, so it sets behind the mountains.
 
 ### The sky
 
@@ -385,9 +392,9 @@ Terrain, in order:
 
 1. Erosion. Bake hydraulic erosion (simulated water carving gullies and drainage) into the
    heightmap. It is what makes mountains read as real; ridged noise alone reads as soft.
-2. Shadows and materials. A short march towards the sun so mountains shadow themselves, then
-   rock, grass and snow by slope and altitude. Cloud shadows on steep slopes show as stripes,
-   one per shadow sample, and want fixing here.
+2. Materials: rock, grass and snow by slope and altitude. Cloud shadows on steep slopes show as
+   stripes, one per shadow sample, and want fixing here. Clouds are not yet shadowed by
+   mountains.
 3. Detail finer than the 47 m texel, added in the shader near the camera.
 
 Everything else, in rough order:

@@ -54,7 +54,12 @@ struct Scatter {
 // and the sun, and `mu_sun0` the sun's cosine to straight-up at the origin.
 // Those four numbers give the altitude and sun angle at any distance along
 // it, which is all the two tables need.
-fn atmosphere(r0: f32, mu: f32, nu: f32, mu_sun0: f32, t0: f32, t1: f32, steps: i32) -> Scatter {
+//
+// `lit` is how much of the sun reaches the air at t0 and at t1, 0..1, blended
+// in between: 1 for open air, less where something solid (a mountain range)
+// shades it. Shaded air still glows with light scattered in from elsewhere,
+// only not with direct sun.
+fn atmosphere(r0: f32, mu: f32, nu: f32, mu_sun0: f32, t0: f32, t1: f32, steps: i32, lit: vec2<f32>) -> Scatter {
     var out: Scatter;
     out.light = vec3<f32>(0.0);
     out.through = vec3<f32>(1.0);
@@ -87,7 +92,7 @@ fn atmosphere(r0: f32, mu: f32, nu: f32, mu_sun0: f32, t0: f32, t1: f32, steps: 
         let scatter = rayleigh + MIE_SCATTER * mie;
         let extinction = rayleigh + MIE_EXTINCTION * mie + ozone;
 
-        let direct = sun_transmittance(r, mu_sun);
+        let direct = sun_transmittance(r, mu_sun) * mix(lit.x, lit.y, (f32(i) + 0.5) / n);
         let bounced = textureSampleLevel(
             multiscatter_table, table_sampler,
             vec2<f32>(mu_sun * 0.5 + 0.5, altitude / (R_TOP - R_GROUND)), 0.0).rgb;
