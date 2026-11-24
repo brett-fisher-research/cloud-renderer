@@ -236,7 +236,10 @@ trunk build --release      # static files in dist/, hostable anywhere
 ```
 
 Live at https://clouds.brettfisher.dev, a Cloudflare Workers static-assets project (`wrangler.jsonc`).
-Deploy with `trunk build --release && npx wrangler deploy`.
+Deploy from this machine with `trunk build --release && npx wrangler deploy`. That is the only
+way it deploys: the repo is deliberately not connected to Cloudflare's git builds, so a push
+does not redeploy. On Linux, install trunk with `cargo install trunk --locked`; wrangler needs
+`npx wrangler login` once per machine.
 
 It has the window, the camera and the dials. Everything that needs an OS is compiled out with
 `cfg(target_arch = "wasm32")`: the command line, `--bench`, `--screenshot`, `--def`, and shader
