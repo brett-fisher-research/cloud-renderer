@@ -110,17 +110,28 @@ impl Ui {
                     ui.set_width(PANEL_WIDTH);
 
                     // The header: click to fold the dials away.
-                    let arrow = if open { "⏷" } else { "⏵" };
-                    let header = ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("{arrow}  cloud dials")).heading(),
-                            )
-                            .selectable(false)
-                            .sense(egui::Sense::click()),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if header.clicked() {
+                    // The arrow is painted as a triangle, the way egui's own
+                    // collapsing headers do it: its fonts have no glyph for one.
+                    let clicked = ui
+                        .horizontal(|ui| {
+                            let side = ui.spacing().icon_width;
+                            let (_, icon) = ui
+                                .allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+                            egui::collapsing_header::paint_default_icon(
+                                ui,
+                                if open { 1.0 } else { 0.0 },
+                                &icon,
+                            );
+                            let title = ui.add(
+                                egui::Label::new(egui::RichText::new("cloud dials").heading())
+                                    .selectable(false)
+                                    .sense(egui::Sense::click()),
+                            );
+                            icon.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                                || title.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                        })
+                        .inner;
+                    if clicked {
                         open = !open;
                     }
                     if !open {
