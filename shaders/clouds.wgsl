@@ -54,8 +54,9 @@ const BASE_SOFTNESS: f32 = 0.07;
 const BASE_VARIATION: f32 = 0.10;
 // Shape of the dome: how fast a cloud narrows towards its top.
 const TOP_ROUNDING: f32 = 0.60;
-// How strongly the detail texture eats into the cloud's edges.
-const DETAIL_STRENGTH: f32 = 0.32;
+// How strongly the detail texture eats into the cloud's edges when the
+// wispiness dial is at 1. The dial's default, 0.5, gives 0.32.
+const DETAIL_STRENGTH_MAX: f32 = 0.64;
 // Near the camera the detail texture is read again, this much finer.
 const FINE_DETAIL_SCALE: f32 = 4.3;
 const FINE_DETAIL_AMOUNT: f32 = 0.5;
@@ -225,12 +226,12 @@ struct Uniforms {
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
-// The three live dials. Must match `struct Params` in src/params.rs exactly.
+// The four live dials. Must match `struct Params` in src/params.rs exactly.
 struct Params {
     coverage: f32,         // 0 = clear sky, 1 = solid overcast
     feature_size: f32,     // metres: width of a typical cloud
     shadow_strength: f32,  // scales self-shadowing
-    _pad: f32,             // unused; fills the 16-byte row
+    wispiness: f32,        // 0 = smooth, 1 = ragged: scales the detail noise
 };
 @group(0) @binding(1) var<uniform> dials: Params;
 
@@ -523,7 +524,8 @@ fn cloud_density(xz: vec2<f32>, height: f32, w: vec3<f32>, lod: vec2<f32>, detai
     var width = EDGE_WIDTH * SHADOW_SOFTNESS;
 
     if (detail) {
-        if (s <= -DETAIL_STRENGTH) {
+        let detail_strength = dials.wispiness * DETAIL_STRENGTH_MAX;
+        if (s <= -detail_strength) {
             return 0.0;
         }
         width = EDGE_WIDTH;
@@ -541,7 +543,7 @@ fn cloud_density(xz: vec2<f32>, height: f32, w: vec3<f32>, lod: vec2<f32>, detai
         let billow = mix(n, 1.0 - n, saturate(hn * 5.0));
         // Centred on zero, so on average the surface stays where it was and
         // the shadow march (which skips this) still agrees with the picture.
-        s += (0.5 - billow) * 2.0 * DETAIL_STRENGTH;
+        s += (0.5 - billow) * 2.0 * detail_strength;
     }
 
     // The edge is `width` wide in noise units: crisp for the view march,

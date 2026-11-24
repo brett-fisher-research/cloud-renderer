@@ -11,8 +11,8 @@ use bytemuck::{Pod, Zeroable};
 
 /// Matches `struct Params` in `shaders/clouds.wgsl`.
 ///
-/// A uniform block is a multiple of 16 bytes, so dials come in fours. There
-/// are three, so one `_pad` float fills the row; a fourth dial takes its place.
+/// A uniform block is a multiple of 16 bytes, so dials come in fours. These
+/// four fill the block exactly; a fifth means adding three `_pad` floats too.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Params {
@@ -24,8 +24,9 @@ pub struct Params {
     /// Scales self-shadowing. Low values let light through the clouds so
     /// they glow; high values give dark, heavy undersides.
     pub shadow_strength: f32,
-    /// Unused; fills the 16-byte row.
-    pub _pad: f32,
+    /// How far the fine noise pushes the cloud surface in and out. 0 = smooth
+    /// blobs, 1 = ragged and torn.
+    pub wispiness: f32,
 }
 
 impl Default for Params {
@@ -34,7 +35,7 @@ impl Default for Params {
             coverage: 0.45,
             feature_size: 1500.0,
             shadow_strength: 1.0,
-            _pad: 0.0,
+            wispiness: 0.5,
         }
     }
 }
@@ -45,4 +46,5 @@ impl Params {
     pub const COVERAGE_RANGE: std::ops::RangeInclusive<f32> = 0.0..=1.0;
     pub const FEATURE_SIZE_RANGE: std::ops::RangeInclusive<f32> = 500.0..=6000.0;
     pub const SHADOW_STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
+    pub const WISPINESS_RANGE: std::ops::RangeInclusive<f32> = 0.0..=1.0;
 }

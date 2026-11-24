@@ -83,6 +83,10 @@ impl Default for Camera {
 }
 
 impl Camera {
+    /// How far the sun can go, in radians: just below the horizon (dusk) to
+    /// almost overhead.
+    pub const SUN_ELEVATION_RANGE: std::ops::RangeInclusive<f32> = -0.25..=1.55;
+
     /// Apply a mouse drag, in pixels.
     pub fn look(&mut self, dx: f32, dy: f32) {
         const SENSITIVITY: f32 = 0.0035;
@@ -104,7 +108,10 @@ impl Camera {
     pub fn scroll_sun(&mut self, notches: f32) {
         const SUN_SPEED: f32 = 0.04;
         // Allow the sun to dip below the horizon for dusk.
-        self.sun_elevation = (self.sun_elevation + notches * SUN_SPEED).clamp(-0.25, 1.55);
+        self.sun_elevation = (self.sun_elevation + notches * SUN_SPEED).clamp(
+            *Self::SUN_ELEVATION_RANGE.start(),
+            *Self::SUN_ELEVATION_RANGE.end(),
+        );
     }
 
     /// Forward direction of the camera in world space (+Y is up).

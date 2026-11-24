@@ -168,7 +168,7 @@ pub struct App {
     /// false = present as fast as the GPU can, for benchmarking.
     vsync: bool,
     camera: Camera,
-    /// The three live cloud dials, driven by the on-screen panel.
+    /// The four live cloud dials, driven by the on-screen panel.
     params: Params,
     /// Starting window size in real pixels. Resizing the window afterwards
     /// just reconfigures the surface, so this is only where it begins.
@@ -334,6 +334,7 @@ impl App {
             (active.config.width, active.config.height),
             active.config.width as f32 / active.window.inner_size().width.max(1) as f32,
             &mut self.params,
+            &mut self.camera,
             self.fps,
         );
         active.gpu.queue.submit(Some(encoder.finish()));

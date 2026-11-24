@@ -14,6 +14,7 @@ use std::sync::Arc;
 use egui_wgpu::ScreenDescriptor;
 use winit::window::Window;
 
+use crate::camera::Camera;
 use crate::gpu::Gpu;
 use crate::params::Params;
 
@@ -80,6 +81,7 @@ impl Ui {
         // smaller than the window (the web build's resolution cap).
         render_scale: f32,
         params: &mut Params,
+        camera: &mut Camera,
         fps: f32,
     ) {
         let mut raw_input = self.state.take_egui_input(window);
@@ -134,6 +136,57 @@ impl Ui {
                          high gives dark, heavy undersides.",
                     );
 
+                    ui.add(
+                        egui::Slider::new(&mut params.wispiness, Params::WISPINESS_RANGE)
+                            .text("wispiness")
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text(
+                        "How ragged the cloud surface is.\n\
+                         0 = smooth blobs, 1 = torn and wispy.",
+                    );
+
+                    ui.separator();
+
+                    // The sun is camera state, not a cloud dial; the sliders
+                    // edit the same two angles as scroll and shift-drag. They
+                    // show degrees, the camera keeps radians.
+                    let mut height = camera.sun_elevation.to_degrees();
+                    let range = Camera::SUN_ELEVATION_RANGE;
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut height,
+                                range.start().to_degrees()..=range.end().to_degrees(),
+                            )
+                            .text("sun height")
+                            .suffix("°")
+                            .fixed_decimals(0),
+                        )
+                        .on_hover_text(
+                            "Time of day: how high the sun is.\n\
+                             0° is on the horizon; below it is dusk.",
+                        )
+                        .changed()
+                    {
+                        camera.sun_elevation = height.to_radians();
+                    }
+
+                    // Shift-drag can wind the bearing past a full turn.
+                    let mut compass = camera.sun_azimuth.to_degrees().rem_euclid(360.0);
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut compass, 0.0..=360.0)
+                                .text("sun compass")
+                                .suffix("°")
+                                .fixed_decimals(0),
+                        )
+                        .on_hover_text("Which way the sun is, around the horizon.")
+                        .changed()
+                    {
+                        camera.sun_azimuth = compass.to_radians();
+                    }
+
                     ui.separator();
                     reset = ui.button("reset").clicked();
                     ui.label(
@@ -148,7 +201,10 @@ impl Ui {
 
         if reset {
             *params = Params::default();
-            log::info!("dials reset to defaults");
+            let sun = Camera::default();
+            camera.sun_elevation = sun.sun_elevation;
+            camera.sun_azimuth = sun.sun_azimuth;
+            log::info!("dials and sun reset to defaults");
         }
 
         self.state

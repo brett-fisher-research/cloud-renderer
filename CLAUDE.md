@@ -25,8 +25,8 @@ does no geometry, no scene graph and no per-pixel work.
 - `src/noise.rs` — bakes the three tiling noise textures: cloud shape, edge detail, weather map.
 - `src/atmosphere.rs` — bakes the two sky tables: transmittance and multiple scattering.
 - `src/camera.rs` — look-around camera and the `Uniforms` struct sent to the GPU.
-- `src/params.rs` — the three live dials and their slider ranges.
-- `src/ui.rs` — the egui panel the dials are drawn on.
+- `src/params.rs` — the four live dials and their slider ranges.
+- `src/ui.rs` — the egui panel the dials and the two sun sliders are drawn on.
 - `src/renderer.rs` — pipelines, bindings, the history textures and per-frame temporal state,
   and shader compilation with hot-reload.
 - `src/app.rs` — winit event loop, mouse input, FPS counter, start-up on both platforms.
@@ -37,8 +37,8 @@ does no geometry, no scene graph and no per-pixel work.
 ### Shader side (WGSL)
 
 `shaders/clouds.wgsl` holds everything visual. Every tunable is a named `const` in one block at
-the top and changes on save. Three values are live dials instead, in `struct Params`: coverage,
-feature size and shadow strength.
+the top and changes on save. Four values are live dials instead, in `struct Params`: coverage,
+feature size, shadow strength and wispiness.
 
 Per pixel, the fragment shader:
 
@@ -68,8 +68,8 @@ much cloud is at this point" from three textures:
   and no two copies of the tile look alike.
 - Shape (3D Perlin-Worley). Thresholded against a height profile that rises sharply at the base
   and tapers towards the top: flat bottoms, rounded lumpy summits.
-- Detail (3D Worley). Pushes the surface in and out for the cauliflower texture. Read a second
-  time at a finer scale near the camera only.
+- Detail (3D Worley). Pushes the surface in and out for the cauliflower texture, by an amount the
+  wispiness dial scales. Read a second time at a finer scale near the camera only.
 
 The march takes long strides through clear air and backs up to short steps on entering cloud.
 Both lengths grow with distance, and the texture mip follows the step length, which is what keeps
@@ -125,8 +125,8 @@ average of roughly the last twenty.
   happen at the very end.
 - `Uniforms` in `src/camera.rs` and in the shader must match exactly. Each `vec3` takes a 16-byte
   row and uses 12, so one float follows it; four of those slots carry temporal values (`jitter`,
-  `history_frames`, `subpixel_x`, `subpixel_y`). A mismatch gives silent garbage. `Params` is three
-  dials and one padding float, exactly one row; a fourth dial takes the padding's place.
+  `history_frames`, `subpixel_x`, `subpixel_y`). A mismatch gives silent garbage. `Params` is four
+  plain floats, exactly one row; a fifth dial needs three padding floats beside it on both sides.
 - The atmosphere constants are duplicated in `src/atmosphere.rs` and at the top of the shader and
   must match, because the tables are baked from one and read by the other.
 - Bindings in `@group(0)`: uniforms 0 and 1, shape 2, detail 3, weather 4, transmittance 5,
@@ -135,7 +135,7 @@ average of roughly the last twenty.
 - Sphere intersections and altitudes use rearranged formulas (`sphere_exit`) that never subtract
   two planet-sized numbers; the textbook forms lose all precision in 32-bit floats.
 - Noise shape lives in `src/noise.rs` and needs a rebuild to change. How it is used (`*_TILE`,
-  `DETAIL_STRENGTH`, `EDGE_WIDTH`) is shader constants and hot-reloads.
+  `DETAIL_STRENGTH_MAX`, `EDGE_WIDTH`) is shader constants and hot-reloads.
 
 ## Measuring
 
@@ -200,19 +200,21 @@ cargo run --release -- --screenshot out/shot.png --time 120 --sun 0.9 --yaw 0.6 
 ```
 
 Controls: drag to look around, shift-drag to swing the sun around the compass, scroll to raise or
-lower the sun (it can set), Esc to quit. The title bar shows frame rate, resolution and sun
+lower the sun (it can set), Esc to quit. The panel's two sun sliders set the same two angles. The title bar shows frame rate, resolution and sun
 elevation.
 
-The panel in the top-left has the three dials:
+The panel in the top-left has the four dials:
 
 - coverage — how much of the sky is cloud, 0 clear to 1 overcast.
 - feature size — how wide a typical cloud is, 500 m to 6 km.
 - shadow — self-shadowing strength; low glows, high gives heavy dark undersides.
+- wispiness — how ragged the surface is, 0 smooth blobs to 1 torn with loose puffs. The default,
+  0.5, is the old fixed look. At 1 the overcast scene costs about 5% more (9.0 to 9.4 ms).
 
 Brightness has no dial. Auto exposure follows the sun down; its level is `EXPOSURE_BASE` in the
 shader.
 
-Each dial has a flag (`--coverage`, `--feature-size`, `--shadow`), and `--time`,
+Each dial has a flag (`--coverage`, `--feature-size`, `--shadow`, `--wispiness`), and `--time`,
 `--sun`, `--yaw`, `--pitch` set the scene, so any look can be reproduced headlessly. `--sun`,
 `--yaw` and `--pitch` are radians. `out/` is gitignored.
 
