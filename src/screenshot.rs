@@ -95,11 +95,10 @@ pub fn render_to_png(path: &str, opts: &ShotOptions) -> Result<()> {
         opts.time
     );
     log::info!(
-        "dials: coverage {:.2}, feature size {:.0} m, shadow {:.2}, exposure {:.2}",
+        "dials: coverage {:.2}, feature size {:.0} m, shadow {:.2}",
         opts.params.coverage,
         opts.params.feature_size,
-        opts.params.shadow_strength,
-        opts.params.exposure
+        opts.params.shadow_strength
     );
     renderer.update_params(&gpu, &opts.params);
 

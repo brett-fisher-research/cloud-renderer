@@ -225,12 +225,12 @@ struct Uniforms {
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
-// The four live dials. Must match `struct Params` in src/params.rs exactly.
+// The three live dials. Must match `struct Params` in src/params.rs exactly.
 struct Params {
     coverage: f32,         // 0 = clear sky, 1 = solid overcast
     feature_size: f32,     // metres: width of a typical cloud
     shadow_strength: f32,  // scales self-shadowing
-    exposure: f32,         // overall brightness, applied before tone mapping
+    _pad: f32,             // unused; fills the 16-byte row
 };
 @group(0) @binding(1) var<uniform> dials: Params;
 
@@ -929,15 +929,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    // Exposure scales linear radiance like a camera's shutter; the tone map
-    // then compresses the bright end.
     // Glare: light from the sun spreading inside the lens. It lies over the
     // whole picture, clouds included, but only while the sun itself is in
     // clear view of the camera.
     let glare_angle = acos(clamp(nu, -1.0, 1.0)) / 0.00465;
     col += in.sun_glare * pow(1.0 + glare_angle * glare_angle, -1.5);
 
-    col = tone_map(col * in.exposure * dials.exposure);
+    // Exposure scales linear radiance like a camera's shutter; the tone map
+    // then compresses the bright end.
+    col = tone_map(col * in.exposure);
 
     // Temporal accumulation: blend with what this spot of sky looked like
     // over the previous frames.

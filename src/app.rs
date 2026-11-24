@@ -168,7 +168,7 @@ pub struct App {
     /// false = present as fast as the GPU can, for benchmarking.
     vsync: bool,
     camera: Camera,
-    /// The four live cloud dials, driven by the on-screen panel.
+    /// The three live cloud dials, driven by the on-screen panel.
     params: Params,
     /// Starting window size in real pixels. Resizing the window afterwards
     /// just reconfigures the surface, so this is only where it begins.

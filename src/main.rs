@@ -67,7 +67,7 @@ struct Args {
     vsync: bool,
     /// `--def NAME=VALUE` overrides applied to the shader before it compiles.
     defines: defines::Defines,
-    /// Starting values for the four live dials. In windowed mode these are just
+    /// Starting values for the three live dials. In windowed mode these are just
     /// where the sliders begin; headlessly they are the whole story.
     params: params::Params,
 }
@@ -161,10 +161,6 @@ fn parse_args() -> Result<Args> {
                 args.params.shadow_strength =
                     v.parse().with_context(|| format!("bad --shadow: {v}"))?;
             }
-            "--exposure" => {
-                let v = it.next().context("--exposure needs a number (0.1..4)")?;
-                args.params.exposure = v.parse().with_context(|| format!("bad --exposure: {v}"))?;
-            }
             "--def" => {
                 let v = it.next().context("--def needs NAME=VALUE")?;
                 args.defines.push_arg(&v)?;
@@ -193,11 +189,10 @@ fn parse_args() -> Result<Args> {
                      --def NAME=VALUE                override a `const` in the shader\n\
                                                      (repeatable; the file on disk is untouched)\n\
                      \n\
-                     The four live dials. In a window these set where the sliders start:\n\
+                     The three live dials. In a window these set where the sliders start:\n\
                      --coverage <0..1>               how much of the sky is cloud\n\
                      --feature-size <metres>         how big the clouds are\n\
-                     --shadow <0..2>                 self-shadowing strength\n\
-                     --exposure <0.1..4>             overall brightness\n"
+                     --shadow <0..2>                 self-shadowing strength\n"
                 );
                 std::process::exit(0);
             }

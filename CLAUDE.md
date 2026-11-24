@@ -25,7 +25,7 @@ does no geometry, no scene graph and no per-pixel work.
 - `src/noise.rs` — bakes the three tiling noise textures: cloud shape, edge detail, weather map.
 - `src/atmosphere.rs` — bakes the two sky tables: transmittance and multiple scattering.
 - `src/camera.rs` — look-around camera and the `Uniforms` struct sent to the GPU.
-- `src/params.rs` — the four live dials and their slider ranges.
+- `src/params.rs` — the three live dials and their slider ranges.
 - `src/ui.rs` — the egui panel the dials are drawn on.
 - `src/renderer.rs` — pipelines, bindings, the history textures and per-frame temporal state,
   and shader compilation with hot-reload.
@@ -37,8 +37,8 @@ does no geometry, no scene graph and no per-pixel work.
 ### Shader side (WGSL)
 
 `shaders/clouds.wgsl` holds everything visual. Every tunable is a named `const` in one block at
-the top and changes on save. Four values are live dials instead, in `struct Params`: coverage,
-feature size, shadow strength and exposure.
+the top and changes on save. Three values are live dials instead, in `struct Params`: coverage,
+feature size and shadow strength.
 
 Per pixel, the fragment shader:
 
@@ -125,8 +125,8 @@ average of roughly the last twenty.
   happen at the very end.
 - `Uniforms` in `src/camera.rs` and in the shader must match exactly. Each `vec3` takes a 16-byte
   row and uses 12, so one float follows it; four of those slots carry temporal values (`jitter`,
-  `history_frames`, `subpixel_x`, `subpixel_y`). A mismatch gives silent garbage. `Params` is four
-  plain floats, exactly one row; a fifth dial needs three padding floats beside it on both sides.
+  `history_frames`, `subpixel_x`, `subpixel_y`). A mismatch gives silent garbage. `Params` is three
+  dials and one padding float, exactly one row; a fourth dial takes the padding's place.
 - The atmosphere constants are duplicated in `src/atmosphere.rs` and at the top of the shader and
   must match, because the tables are baked from one and read by the other.
 - Bindings in `@group(0)`: uniforms 0 and 1, shape 2, detail 3, weather 4, transmittance 5,
@@ -203,14 +203,16 @@ Controls: drag to look around, shift-drag to swing the sun around the compass, s
 lower the sun (it can set), Esc to quit. The title bar shows frame rate, resolution and sun
 elevation.
 
-The panel in the top-left has the four dials:
+The panel in the top-left has the three dials:
 
 - coverage — how much of the sky is cloud, 0 clear to 1 overcast.
 - feature size — how wide a typical cloud is, 500 m to 6 km.
 - shadow — self-shadowing strength; low glows, high gives heavy dark undersides.
-- exposure — brightness, on top of the automatic exposure that follows the sun down.
 
-Each dial has a flag (`--coverage`, `--feature-size`, `--shadow`, `--exposure`), and `--time`,
+Brightness has no dial. Auto exposure follows the sun down; its level is `EXPOSURE_BASE` in the
+shader.
+
+Each dial has a flag (`--coverage`, `--feature-size`, `--shadow`), and `--time`,
 `--sun`, `--yaw`, `--pitch` set the scene, so any look can be reproduced headlessly. `--sun`,
 `--yaw` and `--pitch` are radians. `out/` is gitignored.
 

@@ -134,14 +134,6 @@ impl Ui {
                          high gives dark, heavy undersides.",
                     );
 
-                    ui.add(
-                        egui::Slider::new(&mut params.exposure, Params::EXPOSURE_RANGE)
-                            .text("exposure")
-                            .logarithmic(true)
-                            .fixed_decimals(2),
-                    )
-                    .on_hover_text("Overall brightness, applied just before tone mapping.");
-
                     ui.separator();
                     reset = ui.button("reset").clicked();
                     ui.label(

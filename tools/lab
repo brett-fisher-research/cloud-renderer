@@ -55,7 +55,7 @@ SCENES = [
     # name            flags
     ("default",       ["--coverage", "0.45", "--feature-size", "1500", "--pitch", "0.25"]),
     ("reported",      ["--coverage", "0.77", "--feature-size", "3300", "--shadow", "0.85",
-                       "--exposure", "0.75", "--pitch", "0.35"]),
+                       "--def", "EXPOSURE_BASE=4.125", "--pitch", "0.35"]),
     ("overcast-up",   ["--coverage", "0.85", "--feature-size", "1500", "--pitch", "0.55"]),
     ("horizon",       ["--coverage", "0.60", "--feature-size", "1500", "--pitch", "0.02"]),
     ("backlit",       ["--coverage", "0.60", "--feature-size", "1500", "--pitch", "0.20",
