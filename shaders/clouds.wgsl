@@ -294,10 +294,9 @@ struct Clouds {
     distance: f32,      // metres to where most of that light came from
 };
 
-// March the cloud shell along a view ray.
-//
-// `sun_light` is the sun's colour after the atmosphere, at cloud altitude.
-fn march_clouds(dir: vec3<f32>, pixel: vec2<f32>, in: VsOut) -> Clouds {
+// March the cloud shell along a view ray, as far as `t_max` metres: whatever
+// the ray ends on. Cloud beyond that is hidden and is not marched.
+fn march_clouds(dir: vec3<f32>, pixel: vec2<f32>, in: VsOut, t_max: f32) -> Clouds {
     var out: Clouds;
     out.light = vec3<f32>(0.0);
     out.through = 1.0;
@@ -312,14 +311,19 @@ fn march_clouds(dir: vec3<f32>, pixel: vec2<f32>, in: VsOut) -> Clouds {
     let cam_r = big_r + CAMERA_HEIGHT;
     let b = cam_r * dir.y;
     let t_in = sphere_exit(b, (CAMERA_HEIGHT - CLOUD_BOTTOM) * (2.0 * big_r + CAMERA_HEIGHT + CLOUD_BOTTOM));
-    let t_out = sphere_exit(b, (CAMERA_HEIGHT - CLOUD_TOP) * (2.0 * big_r + CAMERA_HEIGHT + CLOUD_TOP));
+    if (t_in >= t_max) {
+        // The ray ends before it reaches the layer.
+        return out;
+    }
+    let t_shell = sphere_exit(b, (CAMERA_HEIGHT - CLOUD_TOP) * (2.0 * big_r + CAMERA_HEIGHT + CLOUD_TOP));
+    let t_out = min(t_shell, t_max);
 
     // Sunlight at the point where the ray meets the clouds. The sun's
     // height above the *local* horizon there differs from the camera's:
     // clouds far towards a setting sun are still lit after it sets here.
     let nu = dot(dir, u.sun_dir);
     let cloud_r = R_GROUND + 0.0005 * (CLOUD_BOTTOM + CLOUD_TOP);
-    let t_mid = 0.0005 * (t_in + t_out);
+    let t_mid = 0.0005 * (t_in + t_shell);
     let mu_sun = clamp(((R_GROUND + 0.001 * CAMERA_HEIGHT) * u.sun_dir.y + t_mid * nu) / cloud_r, -1.0, 1.0);
     let sun_light = sun_transmittance(cloud_r, mu_sun);
 
@@ -473,24 +477,29 @@ fn camera_sun_visibility() -> f32 {
     return exp(-depth * step * EXTINCTION);
 }
 
-// How much direct sun reaches a point on the ground through the clouds.
-fn ground_shadow(xz: vec2<f32>) -> f32 {
+// How much direct sun reaches a point through the clouds above it. `xz` is
+// the point's map position and `altitude` its height above the sphere, both
+// in metres.
+fn cloud_shadow(xz: vec2<f32>, altitude: f32) -> f32 {
     let rise = u.sun_dir.y;
-    if (rise < 0.03) {
+    // Only the part of the layer above the point can shade it.
+    let base = max(CLOUD_BOTTOM, altitude);
+    let thickness = CLOUD_TOP - base;
+    if (rise < 0.03 || thickness <= 0.0) {
         return 1.0;
     }
-    // Walk the sun ray up through the whole layer. With the sun low that is
-    // a long slanted path, so the samples must be close enough together not
-    // to step over a cloud — otherwise each sample height casts its own
-    // separate copy of the shadow.
+    // Walk the sun ray up through the layer. With the sun low that is a long
+    // slanted path, so the samples must be close enough together not to step
+    // over a cloud — otherwise each sample height casts its own separate
+    // copy of the shadow.
     var depth = 0.0;
-    let thickness = CLOUD_TOP - CLOUD_BOTTOM;
     let n = f32(GROUND_SHADOW_STEPS);
     let step = thickness / n / rise;
     let lod = lods_for(step);
     for (var i = 0; i < GROUND_SHADOW_STEPS; i++) {
-        let height = (f32(i) + 0.5) / n;
-        let s = (CLOUD_BOTTOM + height * thickness) / rise;
+        let up = (f32(i) + 0.5) / n * thickness;
+        let height = (base - CLOUD_BOTTOM + up) / (CLOUD_TOP - CLOUD_BOTTOM);
+        let s = (base - altitude + up) / rise;
         let p = xz + u.sun_dir.xz * s;
         depth += cloud_density(p, height, weather(p, lod.x), lod, false);
     }

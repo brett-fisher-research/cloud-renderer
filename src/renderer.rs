@@ -29,6 +29,7 @@ use crate::gpu::Gpu;
 use crate::noise;
 use crate::params::Params;
 use crate::shader;
+use crate::terrain;
 
 /// Bindings the renderer itself owns in `@group(0)`. Everything else in the
 /// group is a feature's baked texture and carries its own number.
@@ -132,6 +133,7 @@ impl Renderer {
         // binding it goes on. See the feature's module for what each holds.
         let mut baked = noise::bake(device, &gpu.queue);
         baked.extend(atmosphere::bake_tables(device, &gpu.queue));
+        baked.extend(terrain::bake(device, &gpu.queue));
 
         // Repeat addressing is what makes one cube of noise cover the whole
         // sky: sample coordinates outside 0..1 wrap back around.
@@ -147,11 +149,13 @@ impl Renderer {
         });
         // The atmosphere tables are functions, not patterns: reading past
         // the edge must clamp to the last value, not wrap to the other side.
-        // The history texture is read through this one too.
+        // The history texture and the terrain heightmap, which does not
+        // tile, are read through this one too.
         let table_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("table sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 

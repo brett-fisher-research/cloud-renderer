@@ -29,6 +29,7 @@ mod gpu;
 mod params;
 mod renderer;
 mod shader;
+mod terrain;
 #[cfg(not(target_arch = "wasm32"))]
 mod screenshot;
 mod ui;

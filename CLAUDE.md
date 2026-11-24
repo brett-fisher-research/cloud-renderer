@@ -1,34 +1,58 @@
 # cloud-renderer
 
-A small real-time volumetric cloud renderer in Rust, built as a graphics-programming learning
-project. A window shows a physically based sky over a flat plain, with a layer of sunlit cumulus
-drifting across it, casting shadows on the ground. The same program runs in a native window and,
-compiled to WebAssembly, in a browser tab.
+A small real-time renderer in Rust that is growing into a custom game engine. A window shows a
+physically based sky over a plain ringed by mountains, with a layer of sunlit cumulus drifting
+across it, casting shadows on the ground. The same program runs in a native window and, compiled
+to WebAssembly, in a browser tab.
 
 Brett is an experienced web developer and new to graphics programming. Introduce new graphics
 concepts briefly when they first appear, in replies and in code comments.
 
+## Engine direction
+
+Brett intends to build games on this. Clouds and terrain are features he wants to add to a game
+like plugins, so every change is held to engine standards:
+
+- Separation of concerns. A feature is one Rust module that bakes its data and one shader file
+  that answers questions about the world. It knows nothing about the screen, the frame, or
+  another feature's internals. Only `shaders/frame.wgsl` knows there is a picture.
+- Abstractions over concretions. The renderer receives a list of `Baked` textures and never
+  learns what they hold. The frame receives a `Surface` or a `Clouds` struct and never learns
+  how it was found.
+- Pay only for what is seen. A feature's march takes the distance at which the ray ends, so
+  cloud behind a mountain is never marched.
+
+What is not yet a plugin, so nobody mistakes it for one: features are named in two lists
+(`Renderer::with_entry` and `FILES` in `src/shader.rs`), they share one bind group, the dials in
+`Params` are all cloud dials, and `src/noise.rs` and `src/atmosphere.rs` are the cloud and sky
+features under their old names. Move towards a feature being one registration; do it when a
+third feature arrives, with the real shape of three in hand.
+
 ## Architecture
 
 The split is deliberate: the CPU side stays small and boring so that all the interesting work
-lives in one shader you can edit while the program runs.
+lives in shaders you can edit while the program runs.
 
 ### CPU side (Rust)
 
-Opens a window, bakes five textures once at startup, and each frame writes two small uniform
-buffers and draws one full-screen triangle twice: once for the clouds, once to present them. It
-does no geometry, no scene graph and no per-pixel work.
+Opens a window, has each feature bake its textures once at startup, and each frame writes two
+small uniform buffers and draws one full-screen triangle twice: once for the scene, once to
+present it. It does no geometry, no scene graph and no per-pixel work.
 
 - `src/main.rs` — argument parsing, picks windowed or headless mode; the web entry point.
 - `src/gpu.rs` — wgpu instance, adapter, device and queue. Uses the platform's native backend
   (Vulkan on Linux, Metal on macOS, WebGPU in a browser); logs every adapter it sees.
-- `src/noise.rs` — bakes the three tiling noise textures: cloud shape, edge detail, weather map.
-- `src/atmosphere.rs` — bakes the two sky tables: transmittance and multiple scattering.
+- `src/baked.rs` — `Baked`: a texture a feature baked and the binding its shader reads it on.
+- `src/noise.rs` — clouds: bakes the three tiling noise textures, shape, edge detail, weather map.
+- `src/atmosphere.rs` — sky: bakes the two tables, transmittance and multiple scattering.
+- `src/terrain.rs` — terrain: bakes the heightmap.
+- `src/shader.rs` — joins the shader files into one module and maps compile errors back to the
+  file and line they came from.
 - `src/camera.rs` — look-around camera and the `Uniforms` struct sent to the GPU.
 - `src/params.rs` — the five live dials and their slider ranges.
 - `src/ui.rs` — the egui panel the dials and the two sun sliders are drawn on.
-- `src/renderer.rs` — pipelines, bindings, the history textures and per-frame temporal state,
-  and shader compilation with hot-reload.
+- `src/renderer.rs` — pipelines, the bind group built from the features' `Baked` lists, the
+  history textures and per-frame temporal state, and hot-reload.
 - `src/app.rs` — winit event loop, mouse input, FPS counter, start-up on both platforms.
 - `index.html` — the web build's page: a full-tab canvas and a loading line.
 - `src/screenshot.rs`, `src/bench.rs` — headless still and headless GPU-timed benchmark.
@@ -36,19 +60,30 @@ does no geometry, no scene graph and no per-pixel work.
 
 ### Shader side (WGSL)
 
-`shaders/clouds.wgsl` holds everything visual. Every tunable is a named `const` in one block at
-the top and changes on save. Five values are live dials instead, in `struct Params`: coverage,
-feature size, shadow strength, wispiness and exposure.
+WGSL has no include, so the files in `shaders/` are concatenated into one module. Declaration
+order does not matter in WGSL, so they refer to each other freely.
 
-Per pixel, the fragment shader:
+- `common.wgsl` — the camera height, the two uniform blocks, the samplers, small helpers.
+- `sky.wgsl` — the atmosphere: `atmosphere()` and `sun_transmittance()`.
+- `clouds.wgsl` — the cloud layer: `march_clouds()` and `cloud_shadow()`.
+- `terrain.wgsl` — the ground: `terrain_surface()`.
+- `frame.wgsl` — the vertex stage, lighting of surfaces, compositing, tone mapping, temporal
+  accumulation and the present pass.
+
+Every tunable is a named `const` at the top of its file and changes on save. Five values are
+live dials instead, in `struct Params`: coverage, feature size, shadow strength, wispiness and
+exposure.
+
+Per pixel, `fs_main` in `frame.wgsl`:
 
 1. Builds a view ray from the camera basis.
-2. If the ray hits the ground: shades it with sun, skylight and the shadow of the clouds above.
-3. Otherwise marches the cloud layer, a spherical shell between `CLOUD_BOTTOM` and `CLOUD_TOP`
-   around a round planet. The shell curves down behind the horizon, so there is no vanishing
-   point for the layer to pile into.
-4. Marches the atmosphere twice, in front of the cloud and behind it. The near part fades distant
-   cloud into haze (aerial perspective); the far part is the sky seen through the gaps.
+2. Asks the terrain where the ray ends. If it ends on a surface, lights it with sun, skylight
+   and the shadow of the clouds above.
+3. Marches the cloud layer as far as that end and no further. The layer is a spherical shell
+   between `CLOUD_BOTTOM` and `CLOUD_TOP` around a round planet; it curves down behind the
+   horizon, so there is no vanishing point for it to pile into.
+4. Marches the atmosphere in front of the cloud and behind it. The near part fades distant cloud
+   into haze (aerial perspective); the far part is the sky, or the hillside, seen through gaps.
 5. Composites, adds lens glare around the sun, exposes and tone maps (ACES).
 6. Blends the result with the accumulated previous frames. See Temporal accumulation below.
 
@@ -84,6 +119,27 @@ Lighting at each cloud sample:
 - Later octaves and the glow use the cloud depth overhead (from the weather map) instead of the
   exact path to the sun. With the sun path alone, every bump cast a streak through the cloud.
 - Ambient light is the mean sky from above and ground bounce from below.
+
+### The terrain
+
+A heightfield: one height per map position, so a ray is tested against the ground with a single
+texture fetch and there is no mesh. `src/terrain.rs` bakes a 2048x2048 map of a 96 km square
+centred on the camera: a flat plain out to about 5 km, then a ring of mountains up to 2800 m,
+which puts the higher summits inside the cloud layer.
+
+- Shape: ridged multifractal noise. Folding each noise layer at zero turns its zero crossings
+  into creases that read as ridgelines. There is no erosion yet, so no gullies or drainage.
+- Height is stored across two half-float channels, a coarse part and a remainder. One half
+  float gives steps of over a metre at this relief, which lighting shows as terraces.
+- A third channel holds, at every mip, an upper bound on the height of everything near the
+  sample. A ray higher than that strides a whole texel of that mip untested, so crossing the
+  plain to the mountains takes a handful of steps.
+- Close to the ground the ray steps by a fraction of its clearance (`TERRAIN_STEP_SLOPE`), then
+  bisects to pin the surface. A ray that runs out of steps counts as a hit, not as sky.
+- The bare sphere is terrain of height zero: `terrain_surface` returns it where there is no
+  relief, and `--def TERRAIN_ENABLED=false` gives the picture from before terrain existed.
+- Shading is flat: one matte colour that goes from grass to rock with slope, lit by sun and sky.
+  Mountains do not yet shadow themselves or each other.
 
 ### The sky
 
@@ -123,17 +179,21 @@ average of roughly the last twenty.
   `CAMERA_HEIGHT` (150 m, a hilltop) so the ground reaches a horizon 44 km away and fades into haze.
 - Colours are linear radiance with the sun's illuminance as 1.0. Tone mapping and sRGB encoding
   happen at the very end.
-- `Uniforms` in `src/camera.rs` and in the shader must match exactly. Each `vec3` takes a 16-byte
+- `Uniforms` in `src/camera.rs` and in `shaders/common.wgsl` must match exactly. Each `vec3` takes a 16-byte
   row and uses 12, so one float follows it; four of those slots carry temporal values (`jitter`,
   `history_frames`, `subpixel_x`, `subpixel_y`). A mismatch gives silent garbage. `Params` is five
   plain floats and three of padding, two rows; the next three dials take the padding's places.
-- The atmosphere constants are duplicated in `src/atmosphere.rs` and at the top of the shader and
+- The atmosphere constants are duplicated in `src/atmosphere.rs` and in `shaders/sky.wgsl` and
   must match, because the tables are baked from one and read by the other.
 - Bindings in `@group(0)`: uniforms 0 and 1, shape 2, detail 3, weather 4, transmittance 5,
-  multiple scattering 6, repeating sampler 7, clamping sampler 8, history 9.
+  multiple scattering 6, repeating sampler 7, clamping sampler 8, history 9, terrain 10. A
+  feature's texture bindings are declared in its own shader file and its own Rust module.
+- `TERRAIN_EXTENT` in `shaders/terrain.wgsl` and `EXTENT` in `src/terrain.rs` must match.
 - The weather map is half-float. As 8-bit, its thresholded edges followed quantisation steps.
 - Sphere intersections and altitudes use rearranged formulas (`sphere_exit`) that never subtract
   two planet-sized numbers; the textbook forms lose all precision in 32-bit floats.
+- Terrain shape lives in `src/terrain.rs` and needs a rebuild to change; how it is marched and
+  coloured is shader constants.
 - Noise shape lives in `src/noise.rs` and needs a rebuild to change. How it is used (`*_TILE`,
   `DETAIL_STRENGTH_MAX`, `EDGE_WIDTH`) is shader constants and hot-reloads.
 
@@ -141,9 +201,9 @@ average of roughly the last twenty.
 
 Everything runs headless, so a change can be judged without anyone at the keyboard.
 
-- `tools/shots <name> [flags]` renders twelve standard views and tiles them into
+- `tools/shots <name> [flags]` renders fifteen standard views and tiles them into
   `out/<name>.png`. Look at this after any change to the image.
-- `tools/perf [flags]` prints GPU milliseconds for fourteen scenes at 2560x1440.
+- `tools/perf [flags]` prints GPU milliseconds for seventeen scenes at 2560x1440.
 - `tools/temporal [view flags]` scores temporal accumulation three ways, each with a control:
   error against a converged reference, flicker between consecutive frames, and error at the end
   of a camera pan. Run it after touching anything temporal.
@@ -217,8 +277,9 @@ Each dial has a flag (`--coverage`, `--feature-size`, `--shadow`, `--wispiness`,
 `--sun`, `--yaw`, `--pitch` set the scene, so any look can be reproduced headlessly. `--sun`,
 `--yaw` and `--pitch` are radians. `out/` is gitignored.
 
-Edit `shaders/clouds.wgsl` while it runs and the change appears on save. If the shader fails to
-compile, the error prints with the offending line and the last working version keeps rendering.
+Edit any file in `shaders/` while it runs and the change appears on save. If the shader fails to
+compile, the error prints with the offending file and line and the last working version keeps
+rendering.
 
 After building anything that changes the image, run `tools/shots`, look at the sheet, and fix
 what looks wrong before reporting the work as done.
@@ -260,6 +321,8 @@ What differs from native, and why:
   (`render_scale` in `src/ui.rs`) so it stays the right size and the pointer still lines up.
 - A canvas has no sRGB surface format, so the passes draw into an sRGB *view* of it
   (`target_format` in `src/app.rs`). Native surfaces are already sRGB and take the same path.
+- The terrain heightmap is 1024x1024 on the web, a quarter of the native texels, because the
+  bake is single-threaded there. Its bake time and look in a browser are not yet measured.
 - It needs WebGPU: Chrome, Edge, Brave and recent Safari. There is no WebGL fallback.
 
 Measured in headless Brave on an M5 Pro: 3.4 s from page load to first frame, then a steady
@@ -281,6 +344,12 @@ An effect is only real above 0.016 ms.
 | overcast, looking up | 9.1 | | horizon | 4.8 |
 | into the sun | 6.5 | | sparse (coverage 0.15) | 2.8 |
 | looking straight up | 6.9 | | ground only | 1.4 |
+
+Terrain is free at this stage. Measured before and after on the ten lab scenes, no scene got
+slower: the three mountain scenes moved by less than 0.25 ms (4.34 to 4.35, 5.98 to 5.73, 4.49
+to 4.38) and overcast looking up fell from 9.10 to 8.60 ms, because mountains now hide cloud
+near the horizon and hidden cloud is not marched. The heightmap bake adds 0.28 s to start-up.
+The table above predates terrain; the lab notebook has the current rows (`terrain-flat-shaded`).
 
 Worst case found is 10.5 ms, 2.5 ms inside the budget. Cost follows how much of the screen is
 cloud surface: each ray that enters cloud takes a handful of short steps, each with a light march.
@@ -307,7 +376,16 @@ Where the time goes, and the levers:
 
 ## Roadmap
 
-In rough order:
+Terrain, in order:
+
+1. Erosion. Bake hydraulic erosion (simulated water carving gullies and drainage) into the
+   heightmap. It is what makes mountains read as real; ridged noise alone reads as soft.
+2. Shadows and materials. A short march towards the sun so mountains shadow themselves, then
+   rock, grass and snow by slope and altitude. Cloud shadows on steep slopes show as stripes,
+   one per shadow sample, and want fixing here.
+3. Detail finer than the 47 m texel, added in the shader near the camera.
+
+Everything else, in rough order:
 
 1. Light the air under the clouds correctly. The atmosphere march assumes sunlit air everywhere,
    which gives overcast skies and shadowed ground a blue-violet cast.
@@ -336,7 +414,7 @@ share a checkout.
 
 - Build in small steps and get each one running before starting the next.
 - Commit after each working step with a short descriptive message.
-- Keep tunable values as named constants at the top of the shader rather than inline numbers.
+- Keep tunable values as named constants at the top of the feature's shader file rather than inline numbers.
 - Be generous with logs, so a problem seen while running can be pasted back as text.
 - Keep this file current as the project changes.
 - Record fixed bugs in the commit message: the symptom, the root cause, the fix, and anything

@@ -204,6 +204,25 @@ fn tone_map(x: vec3<f32>) -> vec3<f32> {
     return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
 }
 
+// Radiance leaving a surface towards the eye: direct sun, dimmed by the air
+// and by any cloud above, plus skylight. The surface is matte, so the eye's
+// direction does not matter: light of irradiance E gives albedo * E / pi.
+fn light_surface(surface: Surface, dir: vec3<f32>, in: VsOut) -> vec3<f32> {
+    let r0 = R_GROUND + CAMERA_HEIGHT * 0.001;
+    let r = R_GROUND + surface.altitude * 0.001;
+    // The sun's height above the horizon *there*, which on a round planet
+    // differs from its height here.
+    let mu_sun = clamp(
+        (r0 * u.sun_dir.y + surface.distance * 0.001 * dot(dir, u.sun_dir)) / r, -1.0, 1.0);
+    // The normal is in the camera's frame; correct its up for that too.
+    let facing = max(dot(surface.normal, u.sun_dir) + mu_sun - u.sun_dir.y, 0.0);
+    let sun = sun_transmittance(r + 0.001, mu_sun) * facing
+        * cloud_shadow(dir.xz * surface.distance, surface.altitude);
+    // A slope sees less sky than level ground does.
+    let sky = in.ambient_sky * (0.5 + 0.5 * surface.normal.y);
+    return surface.albedo * (sun / PI + sky);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let pixel = in.clip_pos.xy;
@@ -220,27 +239,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let mu_sun0 = u.sun_dir.y;
     let b = r0 * mu;
 
-    var col: vec3<f32>;
-
-    // Does the ray hit the ground? Same quadratic as `sphere_exit`, but for
-    // a sphere we are outside of, and we want the near root.
-    let c_ground = cam_h * (2.0 * R_GROUND + cam_h);
-    let disc = b * b - c_ground;
-    if (mu < 0.0 && disc > 0.0) {
-        let t_ground = c_ground / (sqrt(disc) - b);
-        let mu_sun = clamp((r0 * mu_sun0 + t_ground * nu) / R_GROUND, -1.0, 1.0);
-        let sun = sun_transmittance(R_GROUND + 0.001, mu_sun) * max(mu_sun, 0.0)
-            * ground_shadow(dir.xz * t_ground * 1000.0);
-        let ground = GROUND_COLOR * (sun / PI + in.ambient_sky);
-        let air = atmosphere(r0, mu, nu, mu_sun0, 0.0, t_ground, SKY_STEPS_NEAR);
-        col = air.light + air.through * ground;
+    // Where the ray ends: on the ground, or at the top of the atmosphere.
+    let surface = terrain_surface(dir, fract(pixel_noise(pixel) + u.jitter));
+    var t_end = sphere_exit(b, (r0 - R_TOP) * (r0 + R_TOP));
+    var steps = SKY_STEPS;
+    // What is at the end of it: the lit ground, or the sun's disc on black.
+    var behind = vec3<f32>(0.0);
+    if (surface.hit) {
+        t_end = surface.distance * 0.001;
+        steps = SKY_STEPS_NEAR;
+        behind = light_surface(surface, dir, in);
     } else {
-        let t_top = sphere_exit(b, (r0 - R_TOP) * (r0 + R_TOP));
-        let clouds = march_clouds(dir, pixel, in);
-
         // The sun itself: a disc half a degree across, far brighter than
         // anything else, dimmer towards its edge ("limb darkening").
-        var behind = vec3<f32>(0.0);
         let sun_angle = acos(clamp(nu, -1.0, 1.0));
         let sun_radius = 0.00465;
         let pixel_angle = 2.0 * u.fov_tan / u.resolution.y;
@@ -250,20 +261,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             let limb = 1.0 - 0.6 * (1.0 - sqrt(1.0 - edge * edge));
             behind = vec3<f32>(disc_cover * limb / (PI * sun_radius * sun_radius));
         }
+    }
 
-        if (clouds.through < 0.999) {
-            // Air in front of the cloud fades and tints it with distance
-            // ("aerial perspective"); air behind it is the sky seen through
-            // its gaps. Split the ray at the cloud and march each part.
-            let t_cloud = clamp(clouds.distance * 0.001, 0.0, t_top);
-            let near = atmosphere(r0, mu, nu, mu_sun0, 0.0, t_cloud, SKY_STEPS_NEAR);
-            let far = atmosphere(r0, mu, nu, mu_sun0, t_cloud, t_top, SKY_STEPS_FAR);
-            let background = far.light + far.through * behind;
-            col = near.light + near.through * (clouds.light + clouds.through * background);
-        } else {
-            let air = atmosphere(r0, mu, nu, mu_sun0, 0.0, t_top, SKY_STEPS);
-            col = air.light + air.through * behind;
-        }
+    // Clouds in front of that, and nothing behind it: the march stops at the
+    // surface, so cloud hidden by a mountain is never paid for.
+    let clouds = march_clouds(dir, pixel, in, t_end * 1000.0);
+
+    var col: vec3<f32>;
+    if (clouds.through < 0.999) {
+        // Air in front of the cloud fades and tints it with distance
+        // ("aerial perspective"); air behind it is the sky, or the hillside,
+        // seen through its gaps. Split the ray at the cloud and march each
+        // part.
+        let t_cloud = clamp(clouds.distance * 0.001, 0.0, t_end);
+        let near = atmosphere(r0, mu, nu, mu_sun0, 0.0, t_cloud, SKY_STEPS_NEAR);
+        let far = atmosphere(r0, mu, nu, mu_sun0, t_cloud, t_end, SKY_STEPS_FAR);
+        let background = far.light + far.through * behind;
+        col = near.light + near.through * (clouds.light + clouds.through * background);
+    } else {
+        let air = atmosphere(r0, mu, nu, mu_sun0, 0.0, t_end, steps);
+        col = air.light + air.through * behind;
     }
 
     // Glare: light from the sun spreading inside the lens. It lies over the
