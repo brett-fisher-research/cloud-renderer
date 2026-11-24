@@ -42,7 +42,7 @@ impl Default for Params {
             feature_size: 1500.0,
             shadow_strength: 1.0,
             wispiness: 0.5,
-            exposure: 1.0,
+            exposure: 0.5,
             _pad: [0.0; 3],
         }
     }
