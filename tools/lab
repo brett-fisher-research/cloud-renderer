@@ -62,6 +62,14 @@ SCENES = [
                        "--sun", "0.08", "--yaw", "0.6"]),
     ("small-features",["--coverage", "0.60", "--feature-size", "1500", "--pitch", "0.30"]),
     ("clear",         ["--coverage", "0.15", "--feature-size", "1500", "--pitch", "0.25"]),
+    # Terrain: the range low in frame under broken cloud, under overcast (the
+    # peaks stand in the cloud base), and as a silhouette against a low sun.
+    ("mountains",         ["--coverage", "0.45", "--feature-size", "1500", "--pitch", "0.06",
+                           "--yaw", "2.2"]),
+    ("mountains-overcast",["--coverage", "0.85", "--feature-size", "1500", "--pitch", "0.10",
+                           "--yaw", "3.6"]),
+    ("mountains-backlit", ["--coverage", "0.30", "--feature-size", "1500", "--pitch", "0.05",
+                           "--sun", "0.08", "--yaw", "0.6"]),
 ]
 
 # Dials for the one field dump per config. The field's repetition is a
@@ -229,7 +237,7 @@ def cmd_run(argv: list[str]) -> int:
           f"acorr {field['base_acorr_peak']:.3f}  axis {field['base_axis_bias']:.2f}"
           f"   (raw: {field['raw_tile_lock']:.3f} / {field['raw_acorr_peak']:.3f} "
           f"/ {field['raw_axis_bias']:.2f})")
-    print(f"  {'scene':<16} {'median':>8} {'p95':>8} {'contrast':>9} {'detail':>8}  budget")
+    print(f"  {'scene':<19} {'median':>8} {'p95':>8} {'contrast':>9} {'detail':>8}  budget")
 
     worst = 0.0
     for scene, flags in SCENES:
@@ -239,7 +247,7 @@ def cmd_run(argv: list[str]) -> int:
         img = imgstat(shot)
         worst = max(worst, perf["ms_median"])
         over = perf["ms_median"] > BUDGET_MS
-        print(f"  {scene:<16} {perf['ms_median']:>7.2f}ms {perf['ms_p95']:>7.2f}ms "
+        print(f"  {scene:<19} {perf['ms_median']:>7.2f}ms {perf['ms_p95']:>7.2f}ms "
               f"{img['contrast']:>9.4f} {img['detail']:>8.5f}  "
               f"{'OVER' if over else 'ok':>5}")
         append({
